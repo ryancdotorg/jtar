@@ -4,7 +4,7 @@ import sys
 import json
 import codecs
 
-class IncrementalJSONDecodeError(json.JSONDecodeError):
+class ConcatonatedJSONDecodeError(json.JSONDecodeError):
     def __init__(self, msg, pos):
         errmsg = '%s: char %d' % (msg, pos)
         ValueError.__init__(self, errmsg)
@@ -18,7 +18,7 @@ class IncrementalJSONDecodeError(json.JSONDecodeError):
         return self.__class__, (self.msg, self.pos)
 
 # internal helper class
-class IncrementalJSONDecoder:
+class ConcatonatedJSONDecoder:
     def __init__(self, decoder, *, separators = {'\n', '\r'}, **kwargs):
         self._decoder = decoder or json.JSONDecoder(**kwargs)
         self._separators = separators
@@ -39,7 +39,7 @@ class IncrementalJSONDecoder:
             try:
                 (o, c) = self._decoder.raw_decode(self._buffer)
             except json.JSONDecodeError as e:
-                raise IncrementalJSONDecodeError(e.msg, e.pos + self._offset)
+                raise ConcatonatedJSONDecodeError(e.msg, e.pos + self._offset)
             self._advance(c)
             yield o
 
@@ -49,7 +49,7 @@ class IncrementalJSONDecoder:
 def load(fp, *, cls=None, encoding='utf-8', errors='strict', chunk_size=(1<<16), **kwargs):
     decoder = cls(**kwargs) if cls else json.JSONDecoder(**kwargs)
     chunk_size = max(4, chunk_size)
-    incr = IncrementalJSONDecoder(decoder)
+    incr = ConcatonatedJSONDecoder(decoder)
 
     # we're using raw_decode which requires strings, so wrap binary files
     if isinstance(fp.read(0), bytes):
@@ -72,4 +72,4 @@ def loads(s, *, cls=None, encoding='utf-8', errors='strict', **kwargs):
     if isinstance(s, (bytes, bytearray)):
         s = s.decode(encoding, errors)
 
-    yield from IncrementalJSONDecoder(decoder).generate(s)
+    yield from ConcatonatedJSONDecoder(decoder).generate(s)
