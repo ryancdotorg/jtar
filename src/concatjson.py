@@ -19,8 +19,8 @@ class IncrementalJSONDecodeError(json.JSONDecodeError):
 
 # internal helper class
 class IncrementalJSONDecoder:
-    def __init__(self, decoder, *, separators = {'\n', '\r'}, **kw):
-        self._decoder = decoder or json.JSONDecoder(**kw)
+    def __init__(self, decoder, *, separators = {'\n', '\r'}, **kwargs):
+        self._decoder = decoder or json.JSONDecoder(**kwargs)
         self._separators = separators
         self._buffer = ''
         self._offset = 0
@@ -46,8 +46,8 @@ class IncrementalJSONDecoder:
     def __len__(self):
         return len(self._buffer)
 
-def load(fp, *, cls=None, encoding='utf-8', errors='strict', chunk_size=(1<<16), **kw):
-    decoder = cls(**kw) if cls else json.JSONDecoder(**kw)
+def load(fp, *, cls=None, encoding='utf-8', errors='strict', chunk_size=(1<<16), **kwargs):
+    decoder = cls(**kwargs) if cls else json.JSONDecoder(**kwargs)
     chunk_size = max(4, chunk_size)
     incr = IncrementalJSONDecoder(decoder)
 
@@ -67,8 +67,8 @@ def load(fp, *, cls=None, encoding='utf-8', errors='strict', chunk_size=(1<<16),
     if saved_error:
         raise saved_error
 
-def loads(s, *, cls=None, encoding='utf-8', errors='strict', **kw):
-    decoder = cls(**kw) if cls else json.JSONDecoder(**kw)
+def loads(s, *, cls=None, encoding='utf-8', errors='strict', **kwargs):
+    decoder = cls(**kwargs) if cls else json.JSONDecoder(**kwargs)
     if isinstance(s, (bytes, bytearray)):
         s = s.decode(encoding, errors)
 
