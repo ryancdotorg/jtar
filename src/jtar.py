@@ -1,33 +1,55 @@
 #!/usr/bin/env python3
 
 import io
+import os
 import re
 import sys
 import tarfile
+import functools
 import subprocess
 
-from pathlib import Path
-
-from os import fdopen, stat, getenv, getcwd, path, chdir
+from os import fdopen, stat, getenv, getcwd, path, chdir, SEEK_SET, SEEK_END
 from base64 import b64decode as b64d
+from collections import namedtuple, OrderedDict
 from functools import partial
 from itertools import chain
+from time import time
 
+# bundled
 import concatjson
+from chmod import vchmod
+
+# @functools.cache is only in Python 3.9+, so provide fall back
+def memoize(fn):
+    decorator = getattr(functools, 'cache', functools.lru_cache(maxsize=None))
+    return decorator(fn)
+
+# @functools.cached_property is only in Python 3.8+, so provide fall back
+def cached_property(fn):
+    decorator = getattr(functools, 'cached_property', lambda fn: property(memoize(fn)))
+    return decorator(fn)
 
 jinja2 = None
 
+SEP = path.sep
 EXPN1 = re.compile(r'(?<!\\)\$\{(\w+)\}')
 EXPN2 = re.compile(r'(?<!\\)\\\$')
 
-# mostly just a dict wrapper
+QueuedInfo = namedtuple('QueuedInfo', ['src', 'is_dir', 'thunk'])
+
 class _Attr:
     def __init__(self, attr, define=None):
-        for k in ('source', 'name'):
-            if k in attr: attr[f'_{k}'] = attr.pop(k)
-        self.__dict__ = attr
+        self._attr = attr
         self._stat = None
         self._define = define
+
+    def sub(self, source, name=None):
+        attr = self._attr.copy()
+        attr['source'] = source
+        if name is None: attr.pop('name', None)
+        else: attr['name'] = name
+        attr.pop('recursive', None)
+        return _Attr(attr, self._define)
 
     def _expand(self, s):
         # expand placeholders in the format of ${varible_name}
@@ -35,80 +57,152 @@ class _Attr:
         # unescape any $ characters
         return EXPN2.sub('$', s)
 
+    def __repr__(self):
+        return self._attr.__repr__()
+
     # needed to make the `in` operator work
     def __contains__(self, item): return hasattr(self, item)
 
-    def __getattr__(self, attrib):
-        if attrib == 'stat':
+    def __getattr__(self, name):
+        # attributes that are required to be present first
+        if name == 'stat':
             if self.source.startswith('base64:'): return None
             if self._stat is None: self._stat = stat(self.source)
             return self._stat
-        # only if _name is missing
-        elif attrib == '_name':
-            return self._source
-        elif attrib == 'name':
-            return self._expand(self._name)
-        elif attrib == 'source':
-            return self._expand(self._source)
-        elif attrib == 'atime':
-            if self.stat: return self.stat.st_atime
-        elif attrib == 'ctime':
-            if self.stat: return self.stat.st_ctime
-        elif attrib in ('template', 'recursive'):
-            return False
-        else:
-            # this makes e.g. `attr.get(...)` work
-            return getattr(self.__dict__, attrib)
+
+        elif name == 'name':
+            name = self._attr.get('name', self._attr['source'])
+            return self._expand(name)
+
+        elif name == 'source':
+            return self._expand(self._attr['source'])
+
+        # optional attributes
+        elif name in self._attr:
+            value = self._attr[name]
+            if name == 'mode':
+                if isinstance(value, int): value = str(value)
+                # returns fn(isdir)
+                if attr.stat:
+                    return partial(vchmod, attr.stat, value)
+                return lambda _: int(value, 8)
+            elif name in ('atime', 'ctime'):
+                if value == 'now':
+                    return time()
+                elif value == 'stat' and self._stat:
+                    return getattr(self._stat, 'st_' + name)
+                return float(value)
+            elif name in ('uname', 'gname'):
+                return '' if value is None else value
+            elif value == 'stat' and self._stat:
+                if hasattr(self._stat, 'st_' + name):
+                    return getattr(self._stat, 'st_' + name)
+            elif name == 'mtime' and value == 'now':
+                return time()
+            return value
+
+        # defaults for keys not present below here
+        elif name in ('template', 'recursive'): return False
+        elif name in ('filter', 'exclude'): return None
+
+        raise AttributeError(f"'{type(self)}' object has no attribute '{name}'")
+
 
 class TarBuilder(tarfile.TarFile):
-    def __init__(self, name=None, mode='r', fileobj=None, **kwargs):
-        super().__init__(name, mode, fileobj, **kwargs)
+    def __init__(self, *args, chdir=None, define={}, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.chdir = chdir
+        self.define = define
+        self.queued = OrderedDict()
+
+    @classmethod
+    def open(cls, out=None, *, compress='', chdir=None, define={}, format=tarfile.PAX_FORMAT, **kwargs):
+        # clean up arguments
+        for kw in ('name', 'mode', 'fileobj'):
+            if kw in kwargs:
+                raise TypeError(f"open() got an unexpected keyword argument '{kw}'")
+
+        # set up output mode and and compression options
+        if isinstance(out, str):
+            kwargs['name'] = out
+            kwargs['mode'] = 'w:' + compress
+        else:
+            if getattr(out, 'seekable', lambda: False)():
+                kwargs['mode'] = 'w:' + compress
+            else:
+                kwargs['mode'] = 'w|' + compress
+
+            kwargs['fileobj'] = out
+
+        return super().open(chdir=chdir, define=define, **kwargs)
+
+    @cached_property
+    def env(self):
+        global jinja2
+        if not jinja2: import jinja2
+        env = jinja2.Environment(
+            loader=jinja2.FileSystemLoader(getcwd(), followlinks=True),
+            autoescape=False, keep_trailing_newline=True,
+        )
+        for k in self.define:
+            env.globals[k] = self.define[k]
+
+        return env
+
+    def queue_thunk(self, attr):
+        src, dst, filter, fn = attr.source, attr.name, partial(modify, attr), None
+        isdir = False
+
+        if src.startswith('base64:'):
+            fn = lambda: io.BytesIO(b64d(src[7:]))
+        elif path.isdir(src):
+            isdir = True
+
+        if attr.template and not path.islink(src) and path.isfile(src):
+            if fn: fn = partial(template, self.env, self.define, filefunc=fn)
+            else: fn = partial(template, self.env, self.define, filename=src)
+
+        if attr.filter:
+            if fn is not None: fn = partial(open, src, 'rb')
+            fn = cmd_filter(attr.filter, fn)
+
+        if fn: thunk = partial(tar_add, filefunc=fn, arcname=dst, filter=filter)
+        else: thunk = partial(tar_add, filename=src, arcname=dst, filter=filter)
+
+        self.queue(dst, QueuedInfo(src, isdir, thunk))
+
+    def queue(self, dst, qi):
+        if not qi.is_dir or dst not in self.queued:
+            self.queued[dst] = qi
+
+    def close(self):
+        for item in self.queued.values():
+            # the thunk adds the item to the TarFile
+            item.thunk(self)
+
+        super().close()
 
 # apply attributes
 def modify(attr, info):
-    info.mode = int(str(attr.mode), 8) if 'mode' in attr else attr.stat.st_mode
+    if 'mode' in attr: info.mode = attr.mode(info.isdir())
 
-    if 'mtime' in attr:
-        info.mtime = attr.stat.st_mtime if attr.mtime == 'stat' else attr.mtime
+    for k in ('mtime', 'linktime', 'uid', 'gid', 'uname', 'gname'):
+        if hasattr(attr, k): setattr(info, k, getattr(attr, k))
 
-    if 'linkname' in attr:
-        info.linkname = attr.linkname
+    for k in ('atime', 'ctime'):
+        if hasattr(attr, k): info.pax_headers[k] = getattr(attr, k)
 
-    if 'uid' in attr:
-        info.uid = attr.stat.st_uid if attr.uid == 'stat' else attr.uid
-
-    if 'gid' in attr:
-        info.gid = attr.stat.st_gid if attr.gid == 'stat' else attr.gid
-
-    if 'uname' in attr:
-        # setting null in json will omit
-        info.uname = '' if attr.uname is None else attr.uname
-
-    if 'gname' in attr:
-        # setting null in json will omit
-        info.gname = '' if attr.gname is None else attr.gname
-
-    if 'atime' in attr:
-        if attr.atime == 'stat':
-            info.pax_headers['atime'] = str(attr.stat.st_atime)
-        else:
-            info.pax_headers['atime'] = str(float(attr.atime))
-
-    if 'ctime' in attr:
-        if attr.ctime == 'stat':
-            info.pax_headers['ctime'] = str(attr.stat.st_ctime)
-        else:
-            info.pax_headers['ctime'] = str(float(attr.ctime))
-
-    if 'exclude' in attr:
+    if attr.exclude is not None:
         if re.fullmatch(attr.exclude, info.name):
             return None
 
     return info
 
-def cmd_filter(args, data):
+def cmd_filter(args, filefunc):
     if not isinstance(args, list):
         raise ValueError("Filter must be an argument list or list of lists!")
+
+    data = filefunc()
 
     if len(args) == 0:
         return data
@@ -125,95 +219,83 @@ def cmd_filter(args, data):
     if isinstance(data, io.BufferedIOBase):
         out = io.BytesIO(out)
 
-    return cmd_filter(args, out) if len(args) else out
+    return cmd_filter(args, lambda: out) if len(args) else out
 
-def tar_add(tar, attr, define, env):
-    src, dst, f = attr.source, attr.name, None
+def template(env, define, *, filename=None, filefunc=None):
+    if filename is not None and filefunc is not None:
+        raise ValueError('Either `filename` or `filefunc` must be non-None')
+    elif filename is not None:
+        template = env.get_template(filename)
+    elif filefunc is not None:
+        template = env.from_string(filefunc().read().decode())
+    else: raise RuntimeError('Impossible!')
 
-    if src.startswith('base64:'):
-        if attr.recursive:
-            raise ValueError("Can't recurse for base64 source!")
-        f = io.BytesIO(b64d(src[7:]))
+    return io.BytesIO(template.render(define).encode())
 
-    if attr.template:
-        if attr.recursive:
-            raise ValueError("Can't recurse for templated source!")
-        template = env.get_template(src)
-        f = io.BytesIO(template.render(define).encode())
+def tar_add(tar, *, filename=None, filefunc=None, arcname=None, filter=None):
+    if arcname is None: arcname = filename
+    if filename is not None and filefunc is not None:
+        raise ValueError('Either `filename` or `filefunc` must be non-None')
+    elif filename is not None:
+        tar.add(filename, arcname, False, filter=filter)
+    elif filefunc is not None:
+        with filefunc() as f:
+            info = tar.tarinfo(arcname)
+            f.seek(0, SEEK_END)
+            info.size = f.tell()
+            f.seek(0, SEEK_SET)
+            info = filter(info)
+            tar.addfile(info, f)
+    else: raise RuntimeError('Impossible!')
 
-    if 'filter' in attr:
-        if attr.recursive:
-            raise ValueError("Can't recurse for filtered source!")
-
-        if f is None:
-            f = open(src, 'rb')
-
-        f = cmd_filter(attr.filter, f)
-
-    if f is None:
-        tar.add(src, dst, attr.recursive, filter=partial(modify, attr))
-    else:
-        info = tarfile.TarInfo(dst)
-        f.seek(0, 2)
-        info.size = f.tell()
-        f.seek(0, 0)
-        info = modify(attr, info)
-        tar.addfile(info, f)
-        f.close()
-
-def tar_items(out, items, *, directory=None, define={}, compress='', format=tarfile.PAX_FORMAT, **kwargs):
+def tar_items(out, items, *, chdir=None, define={}, compress='', format=tarfile.PAX_FORMAT, **kwargs):
     kwargs['format'] = format
 
-    # set up output mode and and compression options
-    if isinstance(out, io.IOBase) or callable(getattr(out, 'write', None)):
-        kwargs['fileobj'] = out
-        if getattr(out, 'seekable', lambda: False)():
-            kwargs['mode'] = 'w:' + compress
-        else:
-            kwargs['mode'] = 'w|' + compress
-    else:
-        kwargs['name'] = out
-        kwargs['mode'] = 'w:' + compress
-
-    #with tarfile.open(**kwargs) as tar:
-    with TarBuilder.open(**kwargs) as tar:
-        if directory:
-            chdir(directory)
+    with TarBuilder.open(out, chdir=chdir, define=define, compress=compress, **kwargs) as tar:
+        if tar.chdir: chdir(tar.chdir)
         env = None
         for item in items:
             # handle both individual items and lists of items
             if not isinstance(item, list): item = [item]
             for attr in map(lambda x: _Attr(x, define), item):
-                if attr.template and env is None:
-                    global jinja2
-                    if not jinja2: import jinja2
-                    env = jinja2.Environment(
-                        loader=jinja2.FileSystemLoader(getcwd(), followlinks=True),
-                        autoescape=False, keep_trailing_newline=True,
-                    )
-                    if define:
-                        for k in define:
-                            env.globals[k] = define[k]
+                if not attr.recursive:
+                    tar.queue_thunk(a)
+                else:
+                    srcbase = attr.source
+                    if srcbase != '' and srcbase[-1] != SEP: srcbase += SEP
 
-                tar_add(tar, attr, define, env)
+                    dstbase = attr.name
+                    if dstbase != '' and dstbase[-1] != SEP: dstbase += SEP
+
+                    if not path.isdir(srcbase):
+                        raise ValueError(f"`recursive` set but `{srcbase}` isn't a directory!")
+
+                    for srcdir, dirnames, filenames in os.walk(srcbase):
+                        if srcdir[-1] != SEP: srcdir += SEP
+                        dstdir = dstbase + srcdir[len(srcbase):]
+                        filenames = chain(dirnames, filenames)
+                        for a in map(lambda x: attr.sub(srcdir+x, dstdir+x), filenames):
+                            tar.queue_thunk(a)
 
 def create_tar(args):
     if args.compress is None:
         if args.outfile and isinstance(args.outfile.name, str):
-            suffix = Path(args.outfile.name).suffix
+            suffix = path.splitext(args.outfile.name)[1]
             if suffix in  ('.gz', '.tgz', '.taz'):
                 args.compress = 'gz'
             elif suffix in ('.bz2', '.tbz', '.tbz2', '.tz2'):
                 args.compress = 'bz2'
             elif suffix in ('.xz', '.txz'):
                 args.compress = 'xz'
+            else:
+                args.compress = ''
         else:
             args.compress = ''
 
     loaders = map(concatjson.load, args.infiles)
     tar_items(
         args.outfile, chain(*loaders),
-        directory=args.directory,
+        chdir=args.chdir,
         compress=args.compress,
         define=args.define or {},
     )
@@ -222,8 +304,7 @@ def create_manifest(args):
     import json
 
     for fd in args.infiles:
-        #with tarfile.open(fileobj=fd.buffer) as tar:
-        with TarBuilder.open(fileobj=fd.buffer) as tar:
+        with tarfile.open(fileobj=fd.buffer) as tar:
             for info in tar:
                 entry = {}
                 entry['source'] = info.name
@@ -270,6 +351,7 @@ def main():
             d[k] = v
 
     parser = ArgumentParser(description='Generate a tar file from a JSON manifest.')
+
     cargs = parser.add_mutually_exclusive_group()
     cargs.add_argument(
         '--no-auto-compress', dest='compress', action='store_const', const='',
@@ -295,6 +377,7 @@ def main():
         '-g', '--generate', dest='generate', action='store_true',
         help='generate a JSON manifest from tar file'
     )
+
     parser.add_argument(
         '-T', dest='template', type=FileType('r'), metavar='FILE',
         help='read template definitions from FILE'
@@ -304,7 +387,7 @@ def main():
         help='define template variable KEY as VALUE'
     )
     parser.add_argument(
-        '-C', '--directory', dest='directory', type=DirectoryType, metavar='DIR',
+        '-C', '--directory', dest='chdir', type=DirectoryType, metavar='DIR',
         help='treat sources as relative to DIR'
     )
     parser.add_argument(
@@ -318,6 +401,7 @@ def main():
 
     args = parser.parse_args()
 
+    # parse template definitions
     if args.template:
         import json
         decode = json.JSONDecoder().raw_decode
