@@ -29,13 +29,15 @@ def cached_property(fn):
     decorator = getattr(functools, 'cached_property', lambda fn: property(memoize(fn)))
     return decorator(fn)
 
+eprint = partial(print, file=sys.stderr)
+
 jinja2 = None
 
 SEP = path.sep
 EXPN1 = re.compile(r'(?<!\\)\$\{(\w+)\}')
 EXPN2 = re.compile(r'(?<!\\)\\\$')
 
-QueuedInfo = namedtuple('QueuedInfo', ['src', 'is_dir', 'thunk'])
+QueuedInfo = namedtuple('QueuedInfo', ['src', 'thunk'])
 
 class _Attr:
     def __init__(self, attr, define=None):
@@ -109,8 +111,9 @@ class _Attr:
 
 
 class TarBuilder(tarfile.TarFile):
-    def __init__(self, *args, chdir=None, define={}, **kwargs):
+    def __init__(self, *args, chdir=None, dirs='first', define={}, **kwargs):
         super().__init__(*args, **kwargs)
+        self.dirs = dirs
         self.chdir = chdir
         self.define = define
         self.queued = OrderedDict()
@@ -134,22 +137,45 @@ class TarBuilder(tarfile.TarFile):
 
             kwargs['fileobj'] = out
 
+        kwargs['format'] = format
         return super().open(chdir=chdir, define=define, **kwargs)
 
     @cached_property
     def env(self):
         global jinja2
         if not jinja2: import jinja2
-        env = jinja2.Environment(
+        return jinja2.Environment(
             loader=jinja2.FileSystemLoader(getcwd(), followlinks=True),
             autoescape=False, keep_trailing_newline=True,
         )
-        for k in self.define:
-            env.globals[k] = self.define[k]
 
-        return env
+    def _template(self, *, filename=None, filefunc=None):
+        if filename is not None and filefunc is not None:
+            raise ValueError('Either `filename` or `filefunc` must be non-None')
+        elif filename is not None:
+            template = self.env.get_template(filename)
+        elif filefunc is not None:
+            template = self.env.from_string(filefunc().read().decode())
+        else: raise RuntimeError('Impossible!')
 
-    def queue_thunk(self, attr):
+        return io.BytesIO(template.render(self.define).encode())
+
+    def _add(self, *, filename=None, filefunc=None, arcname=None, filter=None):
+        if arcname is None: arcname = filename
+        if filename is not None and filefunc is not None:
+            raise ValueError('Either `filename` or `filefunc` must be non-None')
+        elif filename is not None:
+            self.add(filename, arcname, False, filter=filter)
+        elif filefunc is not None:
+            with filefunc() as f:
+                info = self.tarinfo(arcname)
+                f.seek(0, SEEK_END)
+                info.size = f.tell()
+                f.seek(0, SEEK_SET)
+                self.addfile(filter(info), f)
+        else: raise RuntimeError('Impossible!')
+
+    def queue(self, attr):
         src, dst, filter, fn = attr.source, attr.name, partial(modify, attr), None
         isdir = False
 
@@ -159,27 +185,30 @@ class TarBuilder(tarfile.TarFile):
             isdir = True
 
         if attr.template and not path.islink(src) and path.isfile(src):
-            if fn: fn = partial(template, self.env, self.define, filefunc=fn)
-            else: fn = partial(template, self.env, self.define, filename=src)
+            if fn: fn = partial(self._template, filefunc=fn)
+            else: fn = partial(self._template, filename=src)
 
         if attr.filter:
             if fn is not None: fn = partial(open, src, 'rb')
             fn = cmd_filter(attr.filter, fn)
 
-        if fn: thunk = partial(tar_add, filefunc=fn, arcname=dst, filter=filter)
-        else: thunk = partial(tar_add, filename=src, arcname=dst, filter=filter)
+        if fn: thunk = partial(self._add, filefunc=fn, arcname=dst, filter=filter)
+        else: thunk = partial(self._add, filename=src, arcname=dst, filter=filter)
 
-        self.queue(dst, QueuedInfo(src, isdir, thunk))
+        qi = QueuedInfo(src, thunk)
 
-    def queue(self, dst, qi):
-        if not qi.is_dir or dst not in self.queued:
-            self.queued[dst] = qi
+        if isdir:
+            if self.dirs == 'first':
+                if dst in self.queued: return
+            elif self.dirs == 'omit': return
+            elif self.dirs == 'last': pass
+            else: raise ValueError(f'Invalid dirs value: `{self.dirs}`')
+
+        self.queued[dst] = qi
 
     def close(self):
-        for item in self.queued.values():
-            # the thunk adds the item to the TarFile
-            item.thunk(self)
-
+        # the thunk adds the item to the TarFile
+        for item in self.queued.values(): item.thunk()
         super().close()
 
 # apply attributes
@@ -198,6 +227,7 @@ def modify(attr, info):
 
     return info
 
+# pipe a file through a command
 def cmd_filter(args, filefunc):
     if not isinstance(args, list):
         raise ValueError("Filter must be an argument list or list of lists!")
@@ -221,45 +251,15 @@ def cmd_filter(args, filefunc):
 
     return cmd_filter(args, lambda: out) if len(args) else out
 
-def template(env, define, *, filename=None, filefunc=None):
-    if filename is not None and filefunc is not None:
-        raise ValueError('Either `filename` or `filefunc` must be non-None')
-    elif filename is not None:
-        template = env.get_template(filename)
-    elif filefunc is not None:
-        template = env.from_string(filefunc().read().decode())
-    else: raise RuntimeError('Impossible!')
-
-    return io.BytesIO(template.render(define).encode())
-
-def tar_add(tar, *, filename=None, filefunc=None, arcname=None, filter=None):
-    if arcname is None: arcname = filename
-    if filename is not None and filefunc is not None:
-        raise ValueError('Either `filename` or `filefunc` must be non-None')
-    elif filename is not None:
-        tar.add(filename, arcname, False, filter=filter)
-    elif filefunc is not None:
-        with filefunc() as f:
-            info = tar.tarinfo(arcname)
-            f.seek(0, SEEK_END)
-            info.size = f.tell()
-            f.seek(0, SEEK_SET)
-            info = filter(info)
-            tar.addfile(info, f)
-    else: raise RuntimeError('Impossible!')
-
-def tar_items(out, items, *, chdir=None, define={}, compress='', format=tarfile.PAX_FORMAT, **kwargs):
-    kwargs['format'] = format
-
-    with TarBuilder.open(out, chdir=chdir, define=define, compress=compress, **kwargs) as tar:
+def tar_items(out, items, **kwargs):
+    with TarBuilder.open(out, **kwargs) as tar:
         if tar.chdir: chdir(tar.chdir)
-        env = None
         for item in items:
             # handle both individual items and lists of items
             if not isinstance(item, list): item = [item]
-            for attr in map(lambda x: _Attr(x, define), item):
+            for attr in map(lambda x: _Attr(x, tar.define), item):
                 if not attr.recursive:
-                    tar.queue_thunk(a)
+                    tar.queue(attr)
                 else:
                     srcbase = attr.source
                     if srcbase != '' and srcbase[-1] != SEP: srcbase += SEP
@@ -275,7 +275,7 @@ def tar_items(out, items, *, chdir=None, define={}, compress='', format=tarfile.
                         dstdir = dstbase + srcdir[len(srcbase):]
                         filenames = chain(dirnames, filenames)
                         for a in map(lambda x: attr.sub(srcdir+x, dstdir+x), filenames):
-                            tar.queue_thunk(a)
+                            tar.queue(a)
 
 def create_tar(args):
     if args.compress is None:
@@ -295,9 +295,10 @@ def create_tar(args):
     loaders = map(concatjson.load, args.infiles)
     tar_items(
         args.outfile, chain(*loaders),
-        chdir=args.chdir,
         compress=args.compress,
-        define=args.define or {},
+        define=args.define,
+        chdir=args.chdir,
+        dirs=args.dirs,
     )
 
 def create_manifest(args):
@@ -354,8 +355,8 @@ def main():
 
     cargs = parser.add_mutually_exclusive_group()
     cargs.add_argument(
-        '--no-auto-compress', dest='compress', action='store_const', const='',
-        help='do not automatically compress output file based on suffix',
+        '-a', '--auto-compress', dest='compress', action='store_const', const=None,
+        help='compress output based on file suffix (default)'
     )
     cargs.add_argument(
         '-z', dest='compress', action='store_const', const='gz',
@@ -370,12 +371,26 @@ def main():
         help='compress output with xz'
     )
     cargs.add_argument(
-        '-a', '--auto-compress', dest='compress', action='store_const', const=None,
-        help='compress output based on file suffix (default)'
+        '--no-auto-compress', dest='compress', action='store_const', const='',
+        help='do not automatically compress output file based on suffix',
     )
     cargs.add_argument(
         '-g', '--generate', dest='generate', action='store_true',
         help='generate a JSON manifest from tar file'
+    )
+
+    dargs = parser.add_mutually_exclusive_group()
+    dargs.add_argument(
+        '--dirs-first', dest='dirs', action='store_const', const='first',
+        help='keep first instance of directory (default)'
+    )
+    dargs.add_argument(
+        '--dirs-last', dest='dirs', action='store_const', const='last',
+        help='keep last instance of directory'
+    )
+    dargs.add_argument(
+        '--dirs-omit', dest='dirs', action='store_const', const='omit',
+        help='omit directories'
     )
 
     parser.add_argument(
@@ -398,6 +413,8 @@ def main():
         'infiles', nargs='*', type=FileType('r'), metavar='FILE',
         help='input filename(s)',
     )
+
+    parser.set_defaults(dirs='first', define={})
 
     args = parser.parse_args()
 
