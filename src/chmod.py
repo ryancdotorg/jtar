@@ -22,18 +22,18 @@ _MOD = re.compile(r'''
     )\Z                             # end of string
 ''', re.VERBOSE)
 
-def _or_all(fn, items):
+def or_all(fn, items):
     return reduce(or_, map(fn, items))
 
 # @functools.cache is only in Python 3.9+, so provide fall back to lru_cache
-def _memoize(fn):
+def memoize(fn):
     decorator = getattr(functools, 'cache', functools.lru_cache(maxsize=None))
     return decorator(fn)
 
-def _bits(who, perm, type_=None):
+def bits(who, perm, type_=None):
     if who in ('a', ''): who = 'ugo'
-    if len(who) > 1: return _or_all(lambda w: _bits(w, perm, type_), who)
-    if len(perm) > 1: return _or_all(lambda p: _bits(who, p, type_), perm)
+    if len(who) > 1: return or_all(lambda w: bits(w, perm, type_), who)
+    if len(perm) > 1: return or_all(lambda p: bits(who, p, type_), perm)
 
     if perm == '':
         return 0
@@ -48,7 +48,7 @@ def _bits(who, perm, type_=None):
     elif perm == '*': return getattr(stat, f'S_IRWX{who.upper()}')
     else: return getattr(stat, f'S_I{perm.upper()}{_WHO[who]}')
 
-def _bits_and_or(type_, who, op, octal, sym):
+def bits_and_or(type_, who, op, octal, sym):
     bits_and, bits_or = 0o7777, 0o0
     if octal:
         bits = int(octal, 8)
@@ -66,9 +66,9 @@ def _bits_and_or(type_, who, op, octal, sym):
         elif op == '-':
             bits_and = 0o7777 ^ bits
     else:
-        bits = _bits(who, sym, type_)
+        bits = bits(who, sym, type_)
         if op == '=':
-            bits_and = 0o777 ^ _bits(who, '*')
+            bits_and = 0o777 ^ bits(who, '*')
             if type_ == 'D': bits_and |= S_ISUID | S_ISGID
             bits_or = bits
         elif op == '+':
@@ -78,16 +78,16 @@ def _bits_and_or(type_, who, op, octal, sym):
 
     return bits_and, bits_or
 
-def _chbits(file_and, dir_and, file_or, dir_or):
+def chbits(file_and, dir_and, file_or, dir_or):
     def update(mode, isdir):
         if isdir: return (mode & dir_and) | dir_or
         return (mode & file_and) | file_or
 
     return update
 
-def _chref(src, dst):
-    src_mask, dst_mask = _bits(src, '*'), 0o7777 ^ _bits(dst, '*')
-    src_p, dst_p = _bits(src, 'x').bit_length(), _bits(dst, 'x').bit_length()
+def chref(src, dst):
+    src_mask, dst_mask = bits(src, '*'), 0o7777 ^ bits(dst, '*')
+    src_p, dst_p = bits(src, 'x').bit_length(), bits(dst, 'x').bit_length()
     sw = dst_p - src_p
     if src_p > dst_p:
         shift = src_p - dst_p
@@ -107,8 +107,8 @@ def _chref(src, dst):
 
     return update
 
-@_memoize
-def _parse(mode):
+@memoize
+def parse(mode):
     changes, n = [], 0
 
     for s in mode.split(','):
@@ -127,20 +127,20 @@ def _parse(mode):
             if ref is not None:
                 # generate and push a mode updater from bitmasks, queue reset
                 if n > 0:
-                    changes.append(_chbits(file_and, dir_and, file_or, dir_or))
+                    changes.append(chbits(file_and, dir_and, file_or, dir_or))
                     n = 0
                 # generate and push mode updaters from reference
-                for c in who: changes.append(_chref(ref, c))
+                for c in who: changes.append(chref(ref, c))
             else:
                 n += 1
                 if type_ != 'D':
-                    bits_and, bits_or = _bits_and_or('F', who, op, octal, sym)
+                    bits_and, bits_or = bits_and_or('F', who, op, octal, sym)
                     #print(f'F&{bits_and:04o}')
                     #print(f'F|{bits_or:04o}')
                     file_and &= bits_and
                     file_or = (file_or & bits_and) | bits_or
                 if type_ != 'F':
-                    bits_and, bits_or = _bits_and_or('D', who, op, octal, sym)
+                    bits_and, bits_or = bits_and_or('D', who, op, octal, sym)
                     #print(f'D&{bits_and:04o}')
                     #print(f'D|{bits_or:04o}')
                     dir_and &= bits_and
@@ -149,7 +149,7 @@ def _parse(mode):
             raise ValueError(f'invalid mode: `{mode}`')
 
     # generate and push a mode updater from bitmasks if needed
-    if n > 0: changes.append(_chbits(file_and, dir_and, file_or, dir_or))
+    if n > 0: changes.append(chbits(file_and, dir_and, file_or, dir_or))
 
     if len(changes) == 1:
         update = changes[0]
@@ -158,11 +158,29 @@ def _parse(mode):
             for change in changes: mode = change(mode, isdir)
             return mode
 
-    return _memoize(update)
+    return memoize(update)
 
-@_memoize
+def stat_result(stat, **kwargs):
+    basic = (
+        kwargs.get('st_mode',  stat[0]),
+        kwargs.get('st_ino',   stat[1]),
+        kwargs.get('st_dev',   stat[2]),
+        kwargs.get('st_nlink', stat[3]),
+        kwargs.get('st_uid',   stat[4]),
+        kwargs.get('st_gid',   stat[5]),
+        kwargs.get('st_size',  stat[6]),
+        int(kwargs.get('st_atime', stat[7])),
+        int(kwargs.get('st_mtime', stat[8])),
+        int(kwargs.get('st_ctime', stat[9])),
+    )
+    extra = stat.__reduce__()[1][1]
+    for k, v in kwargs.items(): extra[k] = v
+    return os.stat_result(basic, extra)
+
+@memoize
 def _vchmod(perm, mode, isdir):
-    return _parse(mode)(perm, isdir)
+    update = parse(mode)
+    return update(perm, isdir)
 
 def vchmod(perm, mode, isdir=None):
     if isinstance(perm, int):

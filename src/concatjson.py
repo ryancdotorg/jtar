@@ -4,6 +4,8 @@ import sys
 import json
 import codecs
 
+WHITESPACE = set(' \t\r\n')
+
 class ConcatonatedJSONDecodeError(json.JSONDecodeError):
     def __init__(self, msg, pos):
         errmsg = '%s: char %d' % (msg, pos)
@@ -19,7 +21,7 @@ class ConcatonatedJSONDecodeError(json.JSONDecodeError):
 
 # internal helper class
 class ConcatonatedJSONDecoder:
-    def __init__(self, decoder, *, separators = {'\n', '\r'}, **kwargs):
+    def __init__(self, decoder, *, separators = WHITESPACE, **kwargs):
         self._decoder = decoder or json.JSONDecoder(**kwargs)
         self._separators = separators
         self._buffer = ''
