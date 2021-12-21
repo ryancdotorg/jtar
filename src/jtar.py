@@ -8,9 +8,9 @@ import tarfile
 import functools
 import subprocess
 
-from os import fdopen, stat, getenv, getcwd, path, chdir, SEEK_SET, SEEK_END
+from os import fdopen, stat, path, getcwd, chdir, SEEK_SET, SEEK_END
+from collections import namedtuple, OrderedDict, Iterable
 from base64 import b64decode as b64d
-from collections import namedtuple, OrderedDict
 from functools import partial
 from itertools import chain
 from time import time
@@ -18,20 +18,33 @@ from time import time
 # bundled
 import concatjson
 from chmod import vchmod
+from util import *
 
-# @functools.cache is only in Python 3.9+, so provide fall back
-def memoize(fn):
-    decorator = getattr(functools, 'cache', functools.lru_cache(maxsize=None))
-    return decorator(fn)
+@memoize
+def jinja_filters():
+    # def filter(value, args...)
+    filters = Registrar()
 
-# @functools.cached_property is only in Python 3.8+, so provide fall back
-def cached_property(fn):
-    decorator = getattr(functools, 'cached_property', lambda fn: property(memoize(fn)))
-    return decorator(fn)
+    @filters.register
+    def re_sub(string, pattern, repl):
+        return re.sub(pattern, repl, string)
 
-eprint = partial(print, file=sys.stderr)
+    return filters
 
-jinja2 = None
+@memoize
+def jinja_functions():
+    from random import SystemRandom
+    random = SystemRandom()
+
+    functions = Registrar()
+
+    @functions.register
+    def randint(a, b, fmt=''):
+        n = random.randint(a, b)
+        return ('{:'+fmt+'}').format(n)
+
+    return functions
+
 
 SEP = path.sep
 EXPN1 = re.compile(r'(?<!\\)\$\{(\w+)\}')
@@ -39,19 +52,38 @@ EXPN2 = re.compile(r'(?<!\\)\\\$')
 
 QueuedInfo = namedtuple('QueuedInfo', ['src', 'thunk'])
 
-class _Attr:
-    def __init__(self, attr, define=None):
-        self._attr = attr
+class Entry:
+    def __init__(self, entry, define=None):
+        self._entry = entry
         self._stat = None
         self._define = define
 
     def sub(self, source, name=None):
-        attr = self._attr.copy()
-        attr['source'] = source
-        if name is None: attr.pop('name', None)
-        else: attr['name'] = name
-        attr.pop('recursive', None)
-        return _Attr(attr, self._define)
+        entry = self._entry.copy()
+        entry['source'] = source
+        if name is None: entry.pop('name', None)
+        else: entry['name'] = name
+        entry.pop('recursive', None)
+        return Entry(entry, self._define)
+
+    def apply(self, info):
+        if hasattr(self, 'linkname'):
+            info.type = tarfile.SYMTYPE
+            setattr(info, 'linkname', getattr(self, 'linkname'))
+        elif hasattr(self, 'mode'):
+            info.mode = self.mode(info.isdir())
+
+        for k in ('mtime', 'uid', 'gid', 'uname', 'gname'):
+            if hasattr(self, k): setattr(info, k, getattr(self, k))
+
+        for k in ('atime', 'ctime'):
+            if hasattr(self, k): info.pax_headers[k] = str(getattr(self, k))
+
+        if self.exclude is not None:
+            if re.fullmatch(self.exclude, info.name):
+                return None
+
+        return info
 
     def _expand(self, s):
         # expand placeholders in the format of ${varible_name}
@@ -60,45 +92,48 @@ class _Attr:
         return EXPN2.sub('$', s)
 
     def __repr__(self):
-        return self._attr.__repr__()
+        return self._entry.__repr__()
 
     # needed to make the `in` operator work
     def __contains__(self, item): return hasattr(self, item)
 
     def __getattr__(self, name):
-        # attributes that are required to be present first
         if name == 'stat':
-            if self.source.startswith('base64:'): return None
-            if self._stat is None: self._stat = stat(self.source)
+            if self.source is None or self.source.startswith('base64:'): return None
+            if self._stat is None: self._stat = stat(self.source, follow_symlinks=False)
             return self._stat
 
+        elif name == 'mode' and 'linkname' in self._entry:
+            return lambda _: 0o777
+
         elif name == 'name':
-            name = self._attr.get('name', self._attr['source'])
-            return self._expand(name)
+            if 'name' in self._entry: return self._expand(self._entry['name'])
+            else: return self.source
 
         elif name == 'source':
-            return self._expand(self._attr['source'])
+            if 'linkname' in self._entry and 'source' not in self._entry: return None
+            else: return self._expand(self._entry['source'])
 
         # optional attributes
-        elif name in self._attr:
-            value = self._attr[name]
+        elif name in self._entry:
+            value = self._entry[name]
             if name == 'mode':
                 if isinstance(value, int): value = str(value)
                 # returns fn(isdir)
-                if attr.stat:
-                    return partial(vchmod, attr.stat, value)
+                if self.stat:
+                    return partial(vchmod, entry.stat, value)
                 return lambda _: int(value, 8)
             elif name in ('atime', 'ctime'):
                 if value == 'now':
                     return time()
-                elif value == 'stat' and self._stat:
-                    return getattr(self._stat, 'st_' + name)
+                elif value == 'stat' and self.stat:
+                    return getattr(self.stat, 'st_' + name)
                 return float(value)
             elif name in ('uname', 'gname'):
                 return '' if value is None else value
-            elif value == 'stat' and self._stat:
-                if hasattr(self._stat, 'st_' + name):
-                    return getattr(self._stat, 'st_' + name)
+            elif value == 'stat' and self.stat:
+                if hasattr(self.stat, 'st_' + name):
+                    return getattr(self.stat, 'st_' + name)
             elif name == 'mtime' and value == 'now':
                 return time()
             return value
@@ -107,8 +142,39 @@ class _Attr:
         elif name in ('template', 'recursive'): return False
         elif name in ('filter', 'exclude'): return None
 
+        # fallback to stat
+        elif self.stat:
+            if hasattr(self.stat, 'st_' + name):
+                if name == 'mode': return lambda *a: self.stat.st_mode
+                return getattr(self.stat, 'st_' + name)
+
+
         raise AttributeError(f"'{type(self)}' object has no attribute '{name}'")
 
+# Convience class to bind TarInfo instances to the TarFile they're members of.
+class XferInfo(tarfile.TarInfo):
+    def __new__(cls, *args, **kwargs):
+        if cls is XferInfo:
+            raise TypeError(f"only children of '{cls.__name__}' may be instantiated")
+
+        return object.__new__(cls, *args, **kwargs)
+
+    @classmethod
+    def bound(cls, tar):
+        return type(cls.__name__, (cls,), {'tar': tar})
+
+    def extractfile(self):
+        return self.tar.extractfile(self)
+
+    def transfer(self, target):
+        f = self.extractfile()
+        self.tar = target
+        target.addfile(self, f)
+
+class TarSource(tarfile.TarFile):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.tarinfo = XferInfo.bound(self)
 
 class TarBuilder(tarfile.TarFile):
     def __init__(self, *args, chdir=None, dirs='first', define={}, **kwargs):
@@ -142,12 +208,18 @@ class TarBuilder(tarfile.TarFile):
 
     @cached_property
     def env(self):
-        global jinja2
-        if not jinja2: import jinja2
-        return jinja2.Environment(
-            loader=jinja2.FileSystemLoader(getcwd(), followlinks=True),
+        try:
+            import jinja2
+        except ModuleNotFoundError:
+            raise ModuleNotFoundError('Install `jinja2` to use templates.')
+
+        env = jinja2.Environment(
             autoescape=False, keep_trailing_newline=True,
+            loader=jinja2.FileSystemLoader(getcwd(), followlinks=True),
         )
+        for k, v in jinja_filters().items(): env.filters[k] = v
+        for k, v in jinja_functions().items(): env.globals[k] = v
+        return env
 
     def _template(self, *, filename=None, filefunc=None):
         if filename is not None and filefunc is not None:
@@ -173,24 +245,32 @@ class TarBuilder(tarfile.TarFile):
                 info.size = f.tell()
                 f.seek(0, SEEK_SET)
                 self.addfile(filter(info), f)
-        else: raise RuntimeError('Impossible!')
+        else:
+            info = filter(self.tarinfo(arcname))
+            self.addfile(info)
 
-    def queue(self, attr):
-        src, dst, filter, fn = attr.source, attr.name, partial(modify, attr), None
+    def queue(self, entry):
+        if isinstance(entry, (self.tarinfo, tarfile.TarInfo)):
+            thunk = partial(self.addfile, entry)
+            self.queued[entry.name] = QueuedInfo(entry.name, thunk)
+            return
+
+        src, dst, filter, fn = entry.source, entry.name, entry.apply, None
         isdir = False
 
-        if src.startswith('base64:'):
-            fn = lambda: io.BytesIO(b64d(src[7:]))
-        elif path.isdir(src):
-            isdir = True
+        if src:
+            if src.startswith('base64:'):
+                fn = lambda: io.BytesIO(b64d(src[7:]))
+            elif path.isdir(src):
+                isdir = True
 
-        if attr.template and not path.islink(src) and path.isfile(src):
+        if entry.template and not path.islink(src) and path.isfile(src):
             if fn: fn = partial(self._template, filefunc=fn)
             else: fn = partial(self._template, filename=src)
 
-        if attr.filter:
+        if entry.filter:
             if fn is not None: fn = partial(open, src, 'rb')
-            fn = cmd_filter(attr.filter, fn)
+            fn = cmd_filter(entry.filter, fn)
 
         if fn: thunk = partial(self._add, filefunc=fn, arcname=dst, filter=filter)
         else: thunk = partial(self._add, filename=src, arcname=dst, filter=filter)
@@ -210,22 +290,6 @@ class TarBuilder(tarfile.TarFile):
         # the thunk adds the item to the TarFile
         for item in self.queued.values(): item.thunk()
         super().close()
-
-# apply attributes
-def modify(attr, info):
-    if 'mode' in attr: info.mode = attr.mode(info.isdir())
-
-    for k in ('mtime', 'linktime', 'uid', 'gid', 'uname', 'gname'):
-        if hasattr(attr, k): setattr(info, k, getattr(attr, k))
-
-    for k in ('atime', 'ctime'):
-        if hasattr(attr, k): info.pax_headers[k] = getattr(attr, k)
-
-    if attr.exclude is not None:
-        if re.fullmatch(attr.exclude, info.name):
-            return None
-
-    return info
 
 # pipe a file through a command
 def cmd_filter(args, filefunc):
@@ -251,31 +315,25 @@ def cmd_filter(args, filefunc):
 
     return cmd_filter(args, lambda: out) if len(args) else out
 
-def tar_items(out, items, **kwargs):
+def tar_entries(out, entries, **kwargs):
     with TarBuilder.open(out, **kwargs) as tar:
         if tar.chdir: chdir(tar.chdir)
-        for item in items:
-            # handle both individual items and lists of items
-            if not isinstance(item, list): item = [item]
-            for attr in map(lambda x: _Attr(x, tar.define), item):
-                if not attr.recursive:
-                    tar.queue(attr)
-                else:
-                    srcbase = attr.source
-                    if srcbase != '' and srcbase[-1] != SEP: srcbase += SEP
+        for entry in map(lambda x: Entry(x, tar.define), entries):
+            srcbase = entry.source
+            if not entry.source or not path.isdir(entry.source) or not entry.recursive:
+                tar.queue(entry)
+            else:
+                if srcbase != '' and srcbase[-1] != SEP: srcbase += SEP
 
-                    dstbase = attr.name
-                    if dstbase != '' and dstbase[-1] != SEP: dstbase += SEP
+                dstbase = entry.name
+                if dstbase != '' and dstbase[-1] != SEP: dstbase += SEP
 
-                    if not path.isdir(srcbase):
-                        raise ValueError(f"`recursive` set but `{srcbase}` isn't a directory!")
-
-                    for srcdir, dirnames, filenames in os.walk(srcbase):
-                        if srcdir[-1] != SEP: srcdir += SEP
-                        dstdir = dstbase + srcdir[len(srcbase):]
-                        filenames = chain(dirnames, filenames)
-                        for a in map(lambda x: attr.sub(srcdir+x, dstdir+x), filenames):
-                            tar.queue(a)
+                for srcdir, dirnames, filenames in os.walk(srcbase):
+                    if srcdir[-1] != SEP: srcdir += SEP
+                    dstdir = dstbase + srcdir[len(srcbase):]
+                    filenames = chain(dirnames, filenames)
+                    for a in map(lambda x: entry.sub(srcdir+x, dstdir+x), filenames):
+                        tar.queue(a)
 
 def create_tar(args):
     if args.compress is None:
@@ -292,9 +350,10 @@ def create_tar(args):
         else:
             args.compress = ''
 
-    loaders = map(concatjson.load, args.infiles)
-    tar_items(
-        args.outfile, chain(*loaders),
+    entries = flatten(map(concatjson.load, args.infiles))
+    tar_entries(
+        #args.outfile, chain(*loaders),
+        args.outfile, entries,
         compress=args.compress,
         define=args.define,
         chdir=args.chdir,
@@ -308,13 +367,15 @@ def create_manifest(args):
         with tarfile.open(fileobj=fd.buffer) as tar:
             for info in tar:
                 entry = {}
-                entry['source'] = info.name
+                if not info.linkname:
+                    entry['source'] = info.name
+                else:
+                    entry['linkname'] = info.linkname
                 entry['mtime'] = info.mtime
                 entry['uid'] = info.uid
                 entry['gid'] = info.gid
                 entry['uname'] = info.uname
                 entry['gname'] = info.gname
-                if info.linkname: entry['linkname'] = info.linkname
                 if hasattr(info, 'pax_headers'):
                     pax = info.pax_headers
                     if 'atime' in pax: entry['atime'] = pax['atime']
