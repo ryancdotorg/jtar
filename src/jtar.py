@@ -45,7 +45,6 @@ def jinja_functions():
 
     return functions
 
-
 SEP = path.sep
 EXPN1 = re.compile(r'(?<!\\)\$\{(\w+)\}')
 EXPN2 = re.compile(r'(?<!\\)\\\$')
@@ -103,16 +102,19 @@ class Entry:
             if self._stat is None: self._stat = stat(self.source, follow_symlinks=False)
             return self._stat
 
+        # symlink permissions are always 777
         elif name == 'mode' and 'linkname' in self._entry:
             return lambda _: 0o777
 
-        elif name == 'name':
-            if 'name' in self._entry: return self._expand(self._entry['name'])
-            else: return self.source
-
+        # source is required except for symlinks
         elif name == 'source':
             if 'linkname' in self._entry and 'source' not in self._entry: return None
             else: return self._expand(self._entry['source'])
+
+        # name should either be macro expanded or copied from source
+        elif name == 'name':
+            if 'name' in self._entry: return self._expand(self._entry['name'])
+            else: return self.source
 
         # optional attributes
         elif name in self._entry:
@@ -137,6 +139,12 @@ class Entry:
             elif name == 'mtime' and value == 'now':
                 return time()
             return value
+
+        # special cases for root user/group where only one of id/name is specified
+        elif name == 'uid' and self._entry.get('uname', None) == 'root': return 0
+        elif name == 'gid' and self._entry.get('gname', None) == 'root': return 0
+        elif name == 'uname' and self._entry.get('uid', None) == 0: return 'root'
+        elif name == 'gname' and self._entry.get('gid', None) == 0: return 'root'
 
         # defaults for keys not present below here
         elif name in ('template', 'recursive'): return False
