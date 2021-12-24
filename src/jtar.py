@@ -66,10 +66,11 @@ class Entry:
         return Entry(entry, self._define)
 
     def apply(self, info):
-        if hasattr(self, 'linkname'):
+        if hasattr(self, 'link'):
             info.type = tarfile.SYMTYPE
-            setattr(info, 'linkname', getattr(self, 'linkname'))
-        elif hasattr(self, 'mode'):
+            setattr(info, 'linkname', getattr(self, 'link'))
+
+        if hasattr(self, 'mode'):
             info.mode = self.mode(info.isdir())
 
         for k in ('mtime', 'uid', 'gid', 'uname', 'gname'):
@@ -105,13 +106,15 @@ class Entry:
             return self._stat
 
         # symlink permissions are always 777
-        elif name == 'mode' and 'linkname' in self._entry:
+        elif name == 'mode' and 'link' in self._entry:
             return lambda _: 0o777
 
-        # source is required except for symlinks
+        # source is required except for symlinks and specials
         elif name == 'source':
-            if 'linkname' in self._entry and 'source' not in self._entry: return None
-            else: return self._expand(self._entry['source'])
+            if anyin(self._entry, ('link', 'fifo', 'block', 'char', 'dir')):
+                if 'source' not in self._entry:
+                    return None
+            return self._expand(self._entry['source'])
 
         # name should either be macro expanded or copied from source
         elif name == 'name':
@@ -361,7 +364,6 @@ def create_tar(args):
 
     entries = flatten(map(concatjson.load, args.infiles))
     tar_entries(
-        #args.outfile, chain(*loaders),
         args.outfile, entries,
         compress=args.compress,
         define=args.define,
@@ -377,10 +379,10 @@ def create_manifest(args):
         with tarfile.open(fileobj=fd.buffer) as tar:
             for info in tar:
                 entry = {}
-                if not info.linkname:
-                    entry['source'] = info.name
+                if info.linkname:
+                    entry['link'] = info.linkname
                 else:
-                    entry['linkname'] = info.linkname
+                    entry['source'] = info.name
                 entry['mtime'] = info.mtime
                 entry['uid'] = info.uid
                 entry['gid'] = info.gid
