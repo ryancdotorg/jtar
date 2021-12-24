@@ -12,9 +12,37 @@ def export(fn):
 
 @export
 class Registrar(dict):
-    def register(self, fn, name=None):
-        self[name or fn.__name__] = fn
-        return fn
+    def __init__(self):
+        super().__init__()
+        self._default = None
+
+    def __getitem__(self, key):
+        if self._default and key not in self: return self._default
+        else: return super().__getitem__(key)
+
+    def register(self, *args, **kwargs):
+        if len(args) == 1:
+            if callable(args[0]):
+                fn = args[0]
+                self[fn.__name__] = fn
+                return fn
+
+            name = args[0]
+        elif len(args) == 0 and 'name' in kwargs: name = kwargs['name']
+        else: name = None
+
+        default = kwargs.get('default', False)
+        if name is None and not default: raise TypeError('Invalid argument(s)!')
+
+        def register_name(fn):
+            if name is not None: self[name] = fn
+            if default: self._default = fn
+            return fn
+
+        return register_name
+
+    def dispatch(self, name, *args, **kwargs):
+        return (self[name])(*args, **kwargs)
 
 # @functools.cache is only in Python 3.9+, so provide fall back
 @export
