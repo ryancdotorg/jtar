@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import sys
+import operator
 import functools
 
 from collections.abc import Iterable
@@ -60,6 +61,38 @@ def flatten(i, max_depth=-1):
     if max_depth != 0 and isinstance(i, Iterable) and not isinstance(i, (dict, str, bytes)):
         for s in i: yield from flatten(s, max_depth - 1)
     else: yield i
+
+@export
+def anyin(obj, iterable):
+    return any(map(functools.partial(operator.contains, obj), iterable))
+
+@export
+def allin(obj, iterable):
+    return all(map(functools.partial(operator.contains, obj), iterable))
+
+@export
+def countin(obj, iterable):
+    n, f = 0, filter(functools.partial(operator.contains, obj), iterable)
+    for _ in f: n += 1
+    return n
+
+@export
+def gein(obj, count, iterable):
+    n, f = 0, filter(functools.partial(operator.contains, obj), iterable)
+    for _ in f:
+        n += 1
+        # early exit
+        if n >= count: return True
+
+    return False
+
+@export
+def gtin(obj, count, iterable):
+    return gein(obj, count+1, iterable)
+
+@export
+def multiplein(obj, iterable):
+    return gein(obj, 2, iterable)
 
 @export
 def eprint(*args, **kwargs):
