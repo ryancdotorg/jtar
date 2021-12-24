@@ -48,11 +48,15 @@ def jinja_functions():
 SEP = path.sep
 EXPN1 = re.compile(r'(?<!\\)\$\{(\w+)\}')
 EXPN2 = re.compile(r'(?<!\\)\\\$')
+SPECIALS = ('link', 'fifo', 'block', 'char', 'dir')
 
 QueuedInfo = namedtuple('QueuedInfo', ['src', 'thunk'])
 
 class Entry:
     def __init__(self, entry, define=None):
+        if multiplein(entry, SPECIALS):
+            raise ValueError('Invalid entry contains multiple special keys')
+
         self._entry = entry
         self._stat = None
         self._define = define
@@ -66,12 +70,21 @@ class Entry:
         return Entry(entry, self._define)
 
     def apply(self, info):
-        if hasattr(self, 'link'):
-            info.type = tarfile.SYMTYPE
-            setattr(info, 'linkname', getattr(self, 'link'))
+        if hasattr(self, 'block'):
+            info.type = tarfile.BLKTYPE
+            info.devmajor, info.devminor = self.block
+        elif hasattr(self, 'char'):
+            info.type = tarfile.CHRTYPE
+            info.devmajor, info.devminor = self.char
+        elif hasattr(self, 'link'):
+            info.type, info.linkname = tarfile.SYMTYPE, self.link
+        elif getattr(self, 'fifo', False):
+            info.type = tarfile.FIFOTYPE
+        elif getattr(self, 'dir', False):
+            info.type = tarfile.DIRTYPE
 
         if hasattr(self, 'mode'):
-            info.mode = self.mode(info.isdir())
+            info.mode = self.mode()
 
         for k in ('mtime', 'uid', 'gid', 'uname', 'gname'):
             if hasattr(self, k): setattr(info, k, getattr(self, k))
@@ -107,11 +120,11 @@ class Entry:
 
         # symlink permissions are always 777
         elif name == 'mode' and 'link' in self._entry:
-            return lambda _: 0o777
+            return lambda: 0o777
 
         # source is required except for symlinks and specials
         elif name == 'source':
-            if anyin(self._entry, ('link', 'fifo', 'block', 'char', 'dir')):
+            if anyin(self._entry, SPECIALS):
                 if 'source' not in self._entry:
                     return None
             return self._expand(self._entry['source'])
@@ -126,9 +139,9 @@ class Entry:
             value = self._entry[name]
             if name == 'mode':
                 if isinstance(value, int): value = str(value)
-                # returns fn(isdir)
-                if self.stat: return partial(vchmod, entry.stat, value)
-                return lambda _: int(value, 8)
+                # returns fn()
+                if self.stat: return partial(vchmod, self.stat, value)
+                return lambda: int(value, 8)
             elif name in ('atime', 'ctime'):
                 if value == 'now':
                     return time()
@@ -159,7 +172,6 @@ class Entry:
             if hasattr(self.stat, 'st_' + name):
                 if name == 'mode': return lambda *a: self.stat.st_mode
                 return getattr(self.stat, 'st_' + name)
-
 
         raise AttributeError(f"'{type(self)}' object has no attribute '{name}'")
 
@@ -247,7 +259,7 @@ class TarBuilder(tarfile.TarFile):
     def _add(self, *, filename=None, filefunc=None, arcname=None, filter=None):
         if arcname is None: arcname = filename
         if filename is not None and filefunc is not None:
-            raise ValueError('Either `filename` or `filefunc` must be non-None')
+            raise ValueError('Either `filename` or `filefunc` must None')
         elif filename is not None:
             self.add(filename, arcname, False, filter=filter)
         elif filefunc is not None:
@@ -276,13 +288,14 @@ class TarBuilder(tarfile.TarFile):
             elif path.isdir(src):
                 isdir = True
 
-        if entry.template and not path.islink(src) and path.isfile(src):
-            if fn: fn = partial(self._template, filefunc=fn)
-            else: fn = partial(self._template, filename=src)
+            if path.isfile(src):
+                if entry.template:
+                    if fn: fn = partial(self._template, filefunc=fn)
+                    else: fn = partial(self._template, filename=src)
 
-        if entry.filter:
-            if fn is not None: fn = partial(open, src, 'rb')
-            fn = cmd_filter(entry.filter, fn)
+                if entry.filter:
+                    if fn is not None: fn = partial(open, src, 'rb')
+                    fn = cmd_filter(entry.filter, fn)
 
         if fn: thunk = partial(self._add, filefunc=fn, arcname=dst, filter=filter)
         else: thunk = partial(self._add, filename=src, arcname=dst, filter=filter)
