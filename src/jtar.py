@@ -98,7 +98,9 @@ class Entry:
 
     def __getattr__(self, name):
         if name == 'stat':
+            # no actual file to stat
             if self.source is None or self.source.startswith('base64:'): return None
+            # save data from source file
             if self._stat is None: self._stat = stat(self.source, follow_symlinks=False)
             return self._stat
 
@@ -122,8 +124,7 @@ class Entry:
             if name == 'mode':
                 if isinstance(value, int): value = str(value)
                 # returns fn(isdir)
-                if self.stat:
-                    return partial(vchmod, entry.stat, value)
+                if self.stat: return partial(vchmod, entry.stat, value)
                 return lambda _: int(value, 8)
             elif name in ('atime', 'ctime'):
                 if value == 'now':
@@ -367,6 +368,7 @@ def create_tar(args):
         chdir=args.chdir,
         dirs=args.dirs,
     )
+    args.outfile.flush()
 
 def create_manifest(args):
     import json
