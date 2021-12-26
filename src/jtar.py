@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 
-import io
-import os
 import re
 import sys
 import tarfile
 import functools
 import subprocess
 
-from os import fdopen, stat, path, getcwd, chdir, SEEK_SET, SEEK_END
+from io import BytesIO, BufferedIOBase
+from os import walk, fdopen, stat, path, getcwd, chdir, SEEK_SET, SEEK_END
 from collections import namedtuple, OrderedDict, Iterable
 from base64 import b64decode as b64d
 from functools import partial
@@ -254,7 +253,7 @@ class TarBuilder(tarfile.TarFile):
             template = self.env.from_string(filefunc().read().decode())
         else: raise RuntimeError('Impossible!')
 
-        return io.BytesIO(template.render(self.define).encode())
+        return BytesIO(template.render(self.define).encode())
 
     def _add(self, *, filename=None, filefunc=None, arcname=None, filter=None):
         if arcname is None: arcname = filename
@@ -284,7 +283,7 @@ class TarBuilder(tarfile.TarFile):
 
         if src:
             if src.startswith('base64:'):
-                fn = lambda: io.BytesIO(b64d(src[7:]))
+                fn = lambda: BytesIO(b64d(src[7:]))
             elif path.isdir(src):
                 isdir = True
 
@@ -328,15 +327,15 @@ def cmd_filter(args, filefunc):
     elif not isinstance(args[0], list):
         args = [args]
 
-    if isinstance(data, io.BufferedIOBase):
+    if isinstance(data, BufferedIOBase):
         buf = data.read()
         data.close()
     else:
         buf = data
 
     out = subprocess.check_output(args.pop(0), input=buf)
-    if isinstance(data, io.BufferedIOBase):
-        out = io.BytesIO(out)
+    if isinstance(data, BufferedIOBase):
+        out = BytesIO(out)
 
     return cmd_filter(args, lambda: out) if len(args) else out
 
@@ -353,7 +352,7 @@ def tar_entries(out, entries, **kwargs):
                 dstbase = entry.name
                 if dstbase != '' and dstbase[-1] != SEP: dstbase += SEP
 
-                for srcdir, dirnames, filenames in os.walk(srcbase):
+                for srcdir, dirnames, filenames in walk(srcbase):
                     if srcdir[-1] != SEP: srcdir += SEP
                     dstdir = dstbase + srcdir[len(srcbase):]
                     filenames = chain(dirnames, filenames)
