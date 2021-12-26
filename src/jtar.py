@@ -174,30 +174,117 @@ class Entry:
 
         raise AttributeError(f"'{type(self)}' object has no attribute '{name}'")
 
-# Convience class to bind TarInfo instances to the TarFile they're members of.
-class XferInfo(tarfile.TarInfo):
+# convience class to:
+# * bind TarInfo instances to the TarFile they're members of
+# * provide a directory tree
+VIRTTYPE = b"\xfe"
+DIRTYPES = (VIRTTYPE, tarfile.DIRTYPE)
+class ExtInfo(tarfile.TarInfo):
     def __new__(cls, *args, **kwargs):
-        if cls is XferInfo:
-            raise TypeError(f"only children of '{cls.__name__}' may be instantiated")
+        if cls is ExtInfo:
+            raise TypeError(f"only subclasses of '{cls.__name__}' may be instantiated")
 
-        return object.__new__(cls, *args, **kwargs)
+        return object.__new__(cls)
+
+    def __init__(self, type_=None, children=None, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if type_ is not None: self.type = type_
+        self.children = children if children is not None else {}
+
+    def __getitem__(self, key):
+        return self.children[key]
+
+    def _update_tree(self):
+        rootname, parts = '', self.name.split('/')
+
+        # setup/update root member
+        if self.tar.rootmember is None:
+            if self.name == rootname: self.tar.rootmember = self
+            else: self.tar.rootmember = self.__class__(name=rootname, type_=VIRTTYPE)
+        elif self.name == rootname:
+            self.children = self.tar.rootmember.children
+            self.tar.rootmember = self
+
+        # find/create our direct parent node
+        parent = self.tar.rootmember
+        for i, part in enumerate(parts[:-1], 1):
+            name = '/'.join(parts[:i])
+            if part in parent.children:
+                parent = parent.children[part]
+                continue
+
+            # generate a virtual directory since one doesn't exist in the tree
+            virt = self.__class__(name='/'.join(parts[:i]), type_=VIRTTYPE)
+            parent.children[part] = virt
+            parent = virt
+
+        # replace existing child if required
+        if parts[-1] in parent.children:
+            self.children = parent.children[parts[-1]].children
+
+        # add an entry for ourselves
+        parent.children[parts[-1]] = self
 
     @classmethod
-    def bound(cls, tar):
+    def bind(cls, tar):
         return type(cls.__name__, (cls,), {'tar': tar})
 
-    def extractfile(self):
-        return self.tar.extractfile(self)
+    @classmethod
+    def fromtarfile(cls, tarfile):
+        info = super().fromtarfile(tarfile)
+        info._update_tree()
+        return info
 
-    def transfer(self, target):
-        f = self.extractfile()
-        self.tar = target
-        target.addfile(self, f)
+    @property
+    def files(self):
+        if self.type not in DIRTYPES:
+            raise TypeError(f'ExtInfo member {self.name} is not a directory!')
+        return dict(filter(lambda a: a[1].type not in DIRTYPES, self.children.items()))
+
+    @property
+    def filenames(self):
+        return self.files.keys()
+
+    @property
+    def dirs(self):
+        if self.type not in DIRTYPES:
+            raise TypeError(f'ExtInfo member {self.name} is not a directory!')
+        return dict(filter(lambda a: a[1].type in DIRTYPES, self.children.items()))
+
+    @property
+    def dirnames(self):
+        return self.dirs.keys()
+
+    def isvirt(self):
+        return self.type == VIRTTYPE
+
+    def walk(self):
+        # create a copy of dirnames so it can be modified by the caller, see os.walk
+        dirnames = list(self.dirnames)
+        yield (self.name, dirnames, self.filenames)
+        for dirname in dirnames:
+            yield from self[dirname].walk()
+
+    def extractfile(self):
+        if self.isfile(): return self.tar.extractfile(self)
+        else: raise TypeError(f'ExtInfo member {self.name} is not a regular file!')
+
+    def add_to(self, target):
+        if self.isfile():
+            f = self.extractfile()
+            self.tar = target
+            target.addfile(self, f)
+        else: target.addfile(self)
 
 class TarSource(tarfile.TarFile):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.tarinfo = XferInfo.bound(self)
+        self.rootmember = None
+        super().__init__(tarinfo=ExtInfo.bind(self), *args, **kwargs)
+
+for name in ('add', 'addfile', 'extract', 'extractall'):
+    def fn(self, *args, **kwargs):
+        raise NotImplementedError(f'TarSource instances do not support `{name}`!')
+    setattr(TarSource, name, fn)
 
 class TarBuilder(tarfile.TarFile):
     def __init__(self, *args, chdir=None, dirs='first', define={}, **kwargs):
@@ -271,6 +358,10 @@ class TarBuilder(tarfile.TarFile):
         else:
             info = filter(self.tarinfo(arcname))
             self.addfile(info)
+
+    def addfile(self, tarinfo, fileobj=None):
+        if tarinfo.type != VIRTTYPE:
+            super().addfile(tarinfo, fileobj)
 
     def queue(self, entry):
         if isinstance(entry, (self.tarinfo, tarfile.TarInfo)):
