@@ -14,6 +14,24 @@ from functools import partial
 from itertools import chain
 from time import time
 
+# non-stdlib
+try:
+    # pip3 install zopfli
+    import zopfli
+    zopfli.__COMPRESSOR_DOCSTRING__ = getattr(zopfli, '__COMPRESSOR_DOCSTRING__', '')
+    from zopfli.gzip import compress
+    def zopfli_compress(data, iterations=15):
+        return compress(data, numiterations=iterations)
+except ImportError as e:
+    try:
+        # pip3 install pyzopfli
+        from zopfli import ZopfliCompressor, ZOPFLI_FORMAT_GZIP
+        def zopfli_compress(data, iterations=15):
+            c = ZopfliCompressor(ZOPFLI_FORMAT_GZIP, iterations=iterations)
+            return c.compress(data) + c.flush()
+    except ImportError as e:
+        zopfli_compress = None
+
 # bundled
 import concatjson
 from chmod import vchmod
@@ -465,14 +483,20 @@ def create_tar(args):
         else:
             args.compress = ''
 
+    outfile = BytesIO() if args.zopfli else args.outfile
     entries = flatten(map(concatjson.load, args.infiles))
     tar_entries(
-        args.outfile, entries,
+        outfile, entries,
         compress=args.compress,
         define=args.define,
         chdir=args.chdir,
         dirs=args.dirs,
     )
+
+    if args.zopfli:
+        outfile.flush()
+        args.outfile.write(zopfli_compress(outfile.getvalue(), args.zopfli))
+
     args.outfile.flush()
 
 def create_manifest(args):
@@ -528,6 +552,7 @@ def main():
             d[k] = v
 
     parser = ArgumentParser(description='Generate a tar file from a JSON manifest.')
+    parser.set_defaults(zopfli=None)
 
     cargs = parser.add_mutually_exclusive_group()
     cargs.add_argument(
@@ -535,9 +560,14 @@ def main():
         help='compress output based on file suffix (default)'
     )
     cargs.add_argument(
-        '-z', dest='compress', action='store_const', const='gz',
+        '-z', '--gzip', dest='compress', action='store_const', const='gz',
         help='compress output with gzip',
     )
+    if zopfli_compress:
+        cargs.add_argument(
+            '--zopfli', dest='zopfli', type=int, nargs='?', action='append', metavar='ITERS',
+            help='compress output with zopfli (optional parameter: iterations)'
+        )
     cargs.add_argument(
         '-j', '--bzip2', dest='compress', action='store_const', const='bz2',
         help='compress output with bzip2',
@@ -594,6 +624,16 @@ def main():
 
     args = parser.parse_args()
 
+    if args.zopfli:
+        args.compress = ''
+        args.zopfli = args.zopfli[0] or 15
+
+    if args.outfile is None:
+        args.outfile = fdopen(sys.stdout.fileno(), "wb", closefd=False)
+
+    if len(args.infiles) == 0:
+        args.infiles.append(sys.stdin)
+
     # parse template definitions
     if args.template:
         import json
@@ -627,12 +667,6 @@ def main():
                 if not args.define: args.define = {}
                 # values defined in command line arguments take precedence
                 if k not in args.define: args.define[k] = v
-
-    if args.outfile is None:
-        args.outfile = fdopen(sys.stdout.fileno(), "wb", closefd=False)
-
-    if len(args.infiles) == 0:
-        args.infiles.append(sys.stdin)
 
     if args.generate: create_manifest(args)
     else: create_tar(args)
