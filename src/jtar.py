@@ -14,28 +14,34 @@ from functools import partial
 from itertools import chain
 from time import time
 
+# bundled
+import concatjson
+from chmod import vchmod
+from util import *
+
 # non-stdlib
 try:
+    # XXX this workaround needed if both pyzopfli and zopfli are installed
+    import zopfli; defattr(zopfli, '__COMPRESSOR_DOCSTRING__', '')
+
     # pip3 install zopfli
-    import zopfli
-    zopfli.__COMPRESSOR_DOCSTRING__ = getattr(zopfli, '__COMPRESSOR_DOCSTRING__', '')
     from zopfli.gzip import compress
     def zopfli_compress(data, iterations=15):
         return compress(data, numiterations=iterations)
-except ImportError as e:
+except ImportError:
     try:
         # pip3 install pyzopfli
         from zopfli import ZopfliCompressor, ZOPFLI_FORMAT_GZIP
         def zopfli_compress(data, iterations=15):
             c = ZopfliCompressor(ZOPFLI_FORMAT_GZIP, iterations=iterations)
             return c.compress(data) + c.flush()
-    except ImportError as e:
+    except ImportError:
         zopfli_compress = None
 
-# bundled
-import concatjson
-from chmod import vchmod
-from util import *
+try:
+    import zstandard
+except ImportError:
+    zstandard = None
 
 @memoize
 def jinja_filters():
@@ -130,7 +136,9 @@ class Entry:
     def __getattr__(self, name):
         if name == 'stat':
             # no actual file to stat
-            if self.source is None or self.source.startswith('base64:'): return None
+            if self.source is None: return None
+            elif self.source.startswith('tar:'): return None
+            elif self.source.startswith('base64:'): return None
             # save data from source file
             if self._stat is None: self._stat = stat(self.source, follow_symlinks=False)
             return self._stat
@@ -166,7 +174,7 @@ class Entry:
                     return getattr(self.stat, 'st_' + name)
                 return float(value)
             elif name in ('uname', 'gname'):
-                return '' if value is None else value
+                return ifnone(value, '')
             elif value == 'stat' and self.stat:
                 if hasattr(self.stat, 'st_' + name):
                     return getattr(self.stat, 'st_' + name)
@@ -207,7 +215,7 @@ class ExtInfo(tarfile.TarInfo):
     def __init__(self, type_=None, children=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if type_ is not None: self.type = type_
-        self.children = children if children is not None else {}
+        self.children = ifnone(children, {})
 
     def __getitem__(self, key):
         return self.children[key]
@@ -313,26 +321,62 @@ class TarBuilder(tarfile.TarFile):
         self.queued = OrderedDict()
 
     @classmethod
-    def open(cls, out=None, *, compress='', chdir=None, define={}, format=tarfile.PAX_FORMAT, **kwargs):
+    def zstopen(cls, name=None, mode='r', fileobj=None, compresslevel=None, **kwargs):
+        # TODO support reading
+        if mode != 'w':
+            raise ValueError("mode must be 'w'")
+        elif 'name' in kwargs:
+            raise TypeError("'name' argument not supported")
+
+        try:
+            from zstandard import ZstdCompressor
+        except ImportError:
+            raise CompressionError("zstandard module is not available") from None
+
+        # auto-detect number of threads based on number of cpu cores
+        zstdargs = dict(threads=-1)
+        # if compresslevel is None, use module default by leaving level argument unset
+        if compresslevel is not None: zstdargs['level'] = compresslevel
+        compressor = ZstdCompressor(**zstdargs)
+        # ZstdCompressor only supports operating on stream objects
+        if fileobj is None: fileobj = open(name, 'rb')
+        fileobj = compressor.stream_writer(fileobj)
+
+        try:
+            t = cls.taropen(None, mode, fileobj, **kwargs)
+        except:
+            fileobj.close()
+            raise
+        t._extfileobj = False
+        return t
+
+    @classmethod
+    def open(cls, out=None, *, compress='', level=None, chdir=None, define={}, format=tarfile.PAX_FORMAT, **kwargs):
         # clean up arguments
         for kw in ('name', 'mode', 'fileobj'):
             if kw in kwargs:
                 raise TypeError(f"open() got an unexpected keyword argument '{kw}'")
 
-        # set up output mode and and compression options
+        # open output
+        name, mode, fileobj = None, 'w', None
         if isinstance(out, str):
-            kwargs['name'] = out
-            kwargs['mode'] = 'w:' + compress
+            name = out
         else:
+            fileobj = out
             if getattr(out, 'seekable', lambda: False)():
-                kwargs['mode'] = 'w:' + compress
+                mode = 'w:' + compress
             else:
-                kwargs['mode'] = 'w|' + compress
+                mode = 'w|' + compress
 
-            kwargs['fileobj'] = out
+        kwargs['format'], kwargs['chdir'], kwargs['define'] = format, chdir, define
+        if level is not None or compress in ('zst'):
+            kwargs['preset' if compress == 'xz' else 'compresslevel'] = level
+            if compress == 'gz': return cls.gzopen(name, 'w', fileobj,  **kwargs)
+            elif compress == 'bz2': return cls.bz2open(name, 'w', fileobj, **kwargs)
+            elif compress == 'xz': return cls.xzopen(name, 'w', fileobj, **kwargs)
+            elif compress == 'zst': return cls.zstopen(name, 'w', fileobj, **kwargs)
 
-        kwargs['format'] = format
-        return super().open(chdir=chdir, define=define, **kwargs)
+        return super().open(name, mode, fileobj, **kwargs)
 
     @cached_property
     def env(self):
@@ -381,13 +425,13 @@ class TarBuilder(tarfile.TarFile):
         if tarinfo.type != VIRTTYPE:
             super().addfile(tarinfo, fileobj)
 
-    def queue(self, entry):
+    def queue(self, entry, fn=None):
         if isinstance(entry, (self.tarinfo, tarfile.TarInfo)):
             thunk = partial(self.addfile, entry)
             self.queued[entry.name] = QueuedInfo(entry.name, thunk)
             return
 
-        src, dst, filter, fn = entry.source, entry.name, entry.apply, None
+        src, dst, filter = entry.source, entry.name, entry.apply
         isdir = False
 
         if src:
@@ -396,14 +440,14 @@ class TarBuilder(tarfile.TarFile):
             elif path.isdir(src):
                 isdir = True
 
-            if path.isfile(src):
-                if entry.template:
-                    if fn: fn = partial(self._template, filefunc=fn)
-                    else: fn = partial(self._template, filename=src)
+        if fn or src and path.isfile(src):
+            if entry.template:
+                if fn: fn = partial(self._template, filefunc=fn)
+                else: fn = partial(self._template, filename=src)
 
-                if entry.filter:
-                    if fn is not None: fn = partial(open, src, 'rb')
-                    fn = cmd_filter(entry.filter, fn)
+            if entry.filter:
+                if fn is not None: fn = partial(open, src, 'rb')
+                fn = cmd_filter(entry.filter, fn)
 
         if fn: thunk = partial(self._add, filefunc=fn, arcname=dst, filter=filter)
         else: thunk = partial(self._add, filename=src, arcname=dst, filter=filter)
@@ -472,12 +516,14 @@ def create_tar(args):
     if args.compress is None:
         if args.outfile and isinstance(args.outfile.name, str):
             suffix = path.splitext(args.outfile.name)[1]
-            if suffix in  ('.gz', '.tgz', '.taz'):
+            if suffix in ('.gz', '.tgz', '.taz'):
                 args.compress = 'gz'
             elif suffix in ('.bz2', '.tbz', '.tbz2', '.tz2'):
                 args.compress = 'bz2'
             elif suffix in ('.xz', '.txz'):
                 args.compress = 'xz'
+            elif suffix == '.zst':
+                args.compress = 'zst'
             else:
                 args.compress = ''
         else:
@@ -488,6 +534,7 @@ def create_tar(args):
     tar_entries(
         outfile, entries,
         compress=args.compress,
+        level=args.level,
         define=args.define,
         chdir=args.chdir,
         dirs=args.dirs,
@@ -495,9 +542,10 @@ def create_tar(args):
 
     if args.zopfli:
         outfile.flush()
-        args.outfile.write(zopfli_compress(outfile.getvalue(), args.zopfli))
+        args.outfile.write(zopfli_compress(outfile.getvalue(), ifnone(args.level, 15)))
+        outfile.close()
 
-    args.outfile.flush()
+    args.outfile.close()
 
 def create_manifest(args):
     import json
@@ -552,8 +600,9 @@ def main():
             d[k] = v
 
     parser = ArgumentParser(description='Generate a tar file from a JSON manifest.')
-    parser.set_defaults(zopfli=None)
+    parser.set_defaults(zopfli=False)
 
+    # compression arguments
     cargs = parser.add_mutually_exclusive_group()
     cargs.add_argument(
         '-a', '--auto-compress', dest='compress', action='store_const', const=None,
@@ -565,8 +614,8 @@ def main():
     )
     if zopfli_compress:
         cargs.add_argument(
-            '--zopfli', dest='zopfli', type=int, nargs='?', action='append', metavar='ITERS',
-            help='compress output with zopfli (optional parameter: iterations)'
+            '--zopfli', dest='zopfli', action='store_true',
+            help='compress output with zopfli (gzip compatible)',
         )
     cargs.add_argument(
         '-j', '--bzip2', dest='compress', action='store_const', const='bz2',
@@ -576,6 +625,11 @@ def main():
         '-J', '--xz', dest='compress', action='store_const', const='xz',
         help='compress output with xz'
     )
+    if zstandard:
+        cargs.add_argument(
+            '--zstd', dest='compress', action='store_const', const='zst',
+            help='compress output with zstd',
+        )
     cargs.add_argument(
         '--no-auto-compress', dest='compress', action='store_const', const='',
         help='do not automatically compress output file based on suffix',
@@ -585,6 +639,7 @@ def main():
         help='generate a JSON manifest from tar file'
     )
 
+    # directory arguments
     dargs = parser.add_mutually_exclusive_group()
     dargs.add_argument(
         '--dirs-first', dest='dirs', action='store_const', const='first',
@@ -599,8 +654,13 @@ def main():
         help='omit directories'
     )
 
+    # other arguments
     parser.add_argument(
-        '-T', dest='template', type=FileType('r'), metavar='FILE',
+        '-L', '--level', dest='level', type=int, metavar='LEVEL',
+        help='set compression level',
+    )
+    parser.add_argument(
+        '-D', '--definitions', dest='definitions', type=FileType('r'), metavar='FILE',
         help='read template definitions from FILE'
     )
     parser.add_argument(
@@ -621,12 +681,10 @@ def main():
     )
 
     parser.set_defaults(dirs='first', define={})
-
     args = parser.parse_args()
 
     if args.zopfli:
         args.compress = ''
-        args.zopfli = args.zopfli[0] or 15
 
     if args.outfile is None:
         args.outfile = fdopen(sys.stdout.fileno(), "wb", closefd=False)
@@ -635,7 +693,7 @@ def main():
         args.infiles.append(sys.stdin)
 
     # parse template definitions
-    if args.template:
+    if args.definitions:
         import json
         decode = json.JSONDecoder().raw_decode
         # We look for:
@@ -653,16 +711,16 @@ def main():
         comment = re.compile(r'\s*(?:#.*)?$')
         sep = re.compile(r'\s*(?:(\s*(?:#.*)?)|(\w+)\s*=\s*(?:(".*)|(.*?)\s*(?:#.*)?))$')
 
-        for lineno, line in enumerate(map(lambda x: x.strip(), args.template), 1):
+        for lineno, line in enumerate(map(lambda x: x.strip(), args.definitions), 1):
             m = sep.match(line)
             if m is None:
-                raise ParseError(f'Invalid syntax: {args.template.name}, line {lineno}')
+                raise ParseError(f'Invalid syntax: {args.definitions.name}, line {lineno}')
             _, k, q, v = m.groups()
             if k:
                 if q:
                     v, w = decode(q)
                     if not comment.match(q[w:]):
-                        raise ParseError(f'Invalid syntax: {args.template.name}, line {lineno}')
+                        raise ParseError(f'Invalid syntax: {args.definitions.name}, line {lineno}')
 
                 if not args.define: args.define = {}
                 # values defined in command line arguments take precedence

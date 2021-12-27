@@ -45,6 +45,17 @@ class Registrar(dict):
     def dispatch(self, name, *args, **kwargs):
         return (self[name])(*args, **kwargs)
 
+@export
+def ifnone(obj, default):
+    return obj if obj is not None else default
+
+@export
+def defattr(obj, name, value):
+    if not hasattr(obj, name):
+        setattr(obj, name, value)
+        return True
+    return False
+
 # @functools.cache is only in Python 3.9+, so provide fall back
 @export
 def memoize(fn):
@@ -99,4 +110,3 @@ def eprint(*args, **kwargs):
     if kwargs.pop('file', None):
         raise TypeError('Keyword argument `file` must be omited or `None`!')
     print(*args, file=sys.stderr, **kwargs)
-
