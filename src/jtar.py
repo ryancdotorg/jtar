@@ -335,8 +335,6 @@ class TarBuilder(tarfile.TarFile):
         # TODO support reading
         if mode != 'w':
             raise ValueError("mode must be 'w'")
-        elif 'name' in kwargs:
-            raise TypeError("'name' argument not supported")
 
         try:
             from zstandard import ZstdCompressor
@@ -380,11 +378,14 @@ class TarBuilder(tarfile.TarFile):
 
         kwargs['format'], kwargs['chdir'], kwargs['define'] = format, chdir, define
         if level is not None or compress in ('zst'):
-            kwargs['preset' if compress == 'xz' else 'compresslevel'] = level
-            if compress == 'gz': return cls.gzopen(name, 'w', fileobj,  **kwargs)
-            elif compress == 'bz2': return cls.bz2open(name, 'w', fileobj, **kwargs)
-            elif compress == 'xz': return cls.xzopen(name, 'w', fileobj, **kwargs)
-            elif compress == 'zst': return cls.zstopen(name, 'w', fileobj, **kwargs)
+            if compress == 'gz':
+                return cls.gzopen(name, 'w', fileobj, compresslevel=level, **kwargs)
+            elif compress == 'bz2':
+                return cls.bz2open(name, 'w', fileobj, compresslevel=level, **kwargs)
+            elif compress == 'xz':
+                return cls.xzopen(name, 'w', fileobj, preset=level, **kwargs)
+            elif compress == 'zst':
+                return cls.zstopen(name, 'w', fileobj, compresslevel=level, **kwargs)
 
         return super().open(name, mode, fileobj, **kwargs)
 
@@ -526,13 +527,14 @@ def create_tar(args):
     if args.compress is None:
         if args.outfile and isinstance(args.outfile.name, str):
             suffix = path.splitext(args.outfile.name)[1]
+            # https://github.com/libarchive/libarchive/blob/0fd2ed25d78e9f4505de5dcb6208c6c0ff8d2edb/tar/creation_set.c#L114
             if suffix in ('.gz', '.tgz', '.taz'):
                 args.compress = 'gz'
             elif suffix in ('.bz2', '.tbz', '.tbz2', '.tz2'):
                 args.compress = 'bz2'
             elif suffix in ('.xz', '.txz'):
                 args.compress = 'xz'
-            elif suffix == '.zst':
+            elif suffix in ('.zst', '.tzst'):
                 args.compress = 'zst'
             else:
                 args.compress = ''
