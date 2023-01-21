@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import sys
+import operator
 import functools
 
 from collections.abc import Iterable
@@ -44,6 +45,17 @@ class Registrar(dict):
     def dispatch(self, name, *args, **kwargs):
         return (self[name])(*args, **kwargs)
 
+@export
+def ifnone(obj, default):
+    return obj if obj is not None else default
+
+@export
+def defattr(obj, name, value):
+    if not hasattr(obj, name):
+        setattr(obj, name, value)
+        return True
+    return False
+
 # @functools.cache is only in Python 3.9+, so provide fall back
 @export
 def memoize(fn):
@@ -62,8 +74,39 @@ def flatten(i, max_depth=-1):
     else: yield i
 
 @export
+def anyin(obj, iterable):
+    return any(map(functools.partial(operator.contains, obj), iterable))
+
+@export
+def allin(obj, iterable):
+    return all(map(functools.partial(operator.contains, obj), iterable))
+
+@export
+def countin(obj, iterable):
+    n, f = 0, filter(functools.partial(operator.contains, obj), iterable)
+    for _ in f: n += 1
+    return n
+
+@export
+def gein(obj, count, iterable):
+    n, f = 0, filter(functools.partial(operator.contains, obj), iterable)
+    for _ in f:
+        n += 1
+        # early exit
+        if n >= count: return True
+
+    return False
+
+@export
+def gtin(obj, count, iterable):
+    return gein(obj, count+1, iterable)
+
+@export
+def multiplein(obj, iterable):
+    return gein(obj, 2, iterable)
+
+@export
 def eprint(*args, **kwargs):
     if kwargs.pop('file', None):
         raise TypeError('Keyword argument `file` must be omited or `None`!')
     print(*args, file=sys.stderr, **kwargs)
-

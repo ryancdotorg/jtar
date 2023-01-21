@@ -51,30 +51,30 @@ def bits(who, perm, type_=None):
 def bits_and_or(type_, who, op, octal, sym):
     bits_and, bits_or = 0o7777, 0o0
     if octal:
-        bits = int(octal, 8)
+        bits_ = int(octal, 8)
         if op is None:
             # chmod preserves suid/sgid on directories unless there 5+ digits
             if len(octal) < 5 and type_ == 'D':
                 bits_and = S_ISUID | S_ISGID
             else:
                 bits_and = 0o0
-            bits_or = bits
+            bits_or = bits_
         elif op == '=':
-            bits_and = bits
+            bits_and = bits_
         elif op == '+':
-            bits_or = bits
+            bits_or = bits_
         elif op == '-':
-            bits_and = 0o7777 ^ bits
+            bits_and = 0o7777 ^ bits_
     else:
-        bits = bits(who, sym, type_)
+        bits_ = bits(who, sym, type_)
         if op == '=':
             bits_and = 0o777 ^ bits(who, '*')
             if type_ == 'D': bits_and |= S_ISUID | S_ISGID
-            bits_or = bits
+            bits_or = bits_
         elif op == '+':
-            bits_or = bits
+            bits_or = bits_
         elif op == '-':
-            bits_and = 0o7777 ^ bits
+            bits_and = 0o7777 ^ bits_
 
     return bits_and, bits_or
 
