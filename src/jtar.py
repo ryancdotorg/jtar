@@ -78,6 +78,10 @@ class Entry:
         for k in ('atime', 'ctime'):
             if hasattr(self, k): info.pax_headers[k] = str(getattr(self, k))
 
+        if self.include is not None:
+            if not re.fullmatch(self.include, info.name):
+                return None
+
         if self.exclude is not None:
             if re.fullmatch(self.exclude, info.name):
                 return None
@@ -149,7 +153,7 @@ class Entry:
 
         # defaults for keys not present below here
         elif name in ('template', 'recursive'): return False
-        elif name in ('filter', 'exclude'): return None
+        elif name in ('filter', 'include', 'exclude'): return None
 
         # fallback to stat
         elif self.stat:
