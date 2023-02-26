@@ -739,6 +739,7 @@ def main():
     )
     parser.add_argument(
         '-D', '--definitions', dest='definitions', type=FileType('r'), metavar='FILE',
+        action='append',
         help='read template definitions from FILE'
     )
     parser.add_argument(
@@ -789,20 +790,21 @@ def main():
         comment = re.compile(r'\s*(?:#.*)?$')
         sep = re.compile(r'\s*(?:(\s*(?:#.*)?)|(\w+)\s*=\s*(?:(".*)|(.*?)\s*(?:#.*)?))$')
 
-        for lineno, line in enumerate(map(lambda x: x.strip(), args.definitions), 1):
-            m = sep.match(line)
-            if m is None:
-                raise ParseError(f'Invalid syntax: {args.definitions.name}, line {lineno}')
-            _, k, q, v = m.groups()
-            if k:
-                if q:
-                    v, w = decode(q)
-                    if not comment.match(q[w:]):
-                        raise ParseError(f'Invalid syntax: {args.definitions.name}, line {lineno}')
+        for f in args.definitions:
+            for lineno, line in enumerate(map(lambda x: x.strip(), f), 1):
+                m = sep.match(line)
+                if m is None:
+                    raise ParseError(f'Invalid syntax: {args.definitions.name}, line {lineno}')
+                _, k, q, v = m.groups()
+                if k:
+                    if q:
+                        v, w = decode(q)
+                        if not comment.match(q[w:]):
+                            raise ParseError(f'Invalid syntax: {args.definitions.name}, line {lineno}')
 
-                if not args.define: args.define = {}
-                # values defined in command line arguments take precedence
-                if k not in args.define: args.define[k] = v
+                    if not args.define: args.define = {}
+                    # values defined in command line arguments take precedence
+                    if k not in args.define: args.define[k] = v
 
     if args.generate: create_manifest(args)
     else: create_tar(args)
