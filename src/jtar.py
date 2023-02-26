@@ -9,7 +9,7 @@ import subprocess
 
 from io import BytesIO, BufferedIOBase
 from os import walk, fdopen, stat, path, getcwd, chdir, SEEK_SET, SEEK_END
-from collections import namedtuple, OrderedDict, Iterable
+from collections import namedtuple, defaultdict, OrderedDict, Iterable
 from base64 import b64decode as b64d
 from functools import partial, lru_cache
 from itertools import chain
@@ -77,6 +77,17 @@ SEP = path.sep
 EXPN1 = re.compile(r'(?<!\\)\$\{(\w+)\}')
 EXPN2 = re.compile(r'(?<!\\)\\\$')
 SPECIALS = ('link', 'fifo', 'block', 'char', 'dir')
+# from libarchive - https://git.io/JyREM
+EXTMAP = defaultdict(lambda: '', {
+    k: v
+    for keys, v in [
+        (['.gz', '.tgz', '.taz'], 'gz'),
+        (['.bz2', '.tbz', '.tbz2', '.tz2'], 'bz2'),
+        (['.zst', '.tzst'], 'zst'),
+        (['.xz', '.txz'], 'xz'),
+    ]
+    for k in keys
+})
 
 QueuedInfo = namedtuple('QueuedInfo', ['src', 'thunk'])
 
