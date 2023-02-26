@@ -2,7 +2,6 @@
 
 import re
 import sys
-import crypt
 import tarfile
 import functools
 import subprocess
@@ -46,6 +45,8 @@ except ImportError:
 
 @memoize
 def jinja_filters():
+    import hashlib
+
     # def filter(value, args...)
     filters = Registrar()
 
@@ -53,9 +54,59 @@ def jinja_filters():
     def re_sub(string, pattern, repl):
         return re.sub(pattern, repl, string)
 
-    @filters.register('crypt')
-    def crypt_(string, salt=None):
-        return crypt.crypt(string, salt or crypt.METHOD_MD5)
+    try:
+        import crypt
+
+        @filters.register('md5_crypt')
+        def md5_crypt(string, salt=None):
+            return crypt.crypt(string, ('$1$' + salt) or crypt.METHOD_MD5)
+
+        @filters.register('sha256_crypt')
+        def sha256_crypt(string, salt=None):
+            return crypt.crypt(string, ('$5$' + salt) or crypt.METHOD_SHA256)
+
+        @filters.register('sha512_crypt')
+        def sha512_crypt(string, salt=None):
+            return crypt.crypt(string, ('$6$' + salt) or crypt.METHOD_SHA512)
+
+    except ModuleNotFoundError:
+        pass
+
+    try:
+        import passlib.hash
+        from passlib.hash import md5_crypt, sha256_crypt, sha512_crypt
+
+        @filters.register('md5_crypt')
+        def md5_crypt(string, salt=None):
+            return passlib.hash.md5_crypt.using(salt=salt).hash(string)
+
+        @filters.register('sha256_crypt')
+        def sha256_crypt(string, salt=None):
+            return passlib.hash.sha256_crypt.using(rounds=5000, salt=salt).hash(string)
+
+        @filters.register('sha512_crypt')
+        def sha512_crypt(string, salt=None):
+            return passlib.hash.sha512_crypt.using(rounds=5000, salt=salt).hash(string)
+
+    except ModuleNotFoundError:
+        def bad_crypt(algo):
+            def crypt(string, salt=None):
+                raise ModuleNotFoundError(f'Install `passlib` to use the {algo} filter.')
+
+            return crypt
+
+        for algo in ('md5_crypt', 'sha256_crypt', 'sha512_crypt'):
+            filters.register(algo)(bad_crypt(algo))
+
+    def make_hexdigest(algo):
+        hasher = getattr(hashlib, algo)
+        def hexdigest(string):
+            return hasher(string.encode()).hexdigest()
+
+        return hexdigest
+
+    for algo in hashlib.algorithms_guaranteed:
+        filters.register(algo)(make_hexdigest(algo))
 
     return filters
 
