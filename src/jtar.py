@@ -7,7 +7,7 @@ import functools
 import subprocess
 
 from io import BytesIO, BufferedIOBase
-from os import walk, fdopen, stat, path, getcwd, chdir, SEEK_SET, SEEK_END
+from os import walk, fdopen, stat, stat_result, path, getcwd, chdir, SEEK_SET, SEEK_END
 from collections import namedtuple, defaultdict, OrderedDict
 from base64 import b64decode as b64d
 from functools import partial, lru_cache
@@ -156,6 +156,25 @@ class Entry:
         self._stat = None
         self._define = define
 
+        if entry.get('source', '').startswith('tar:'):
+            member = tarmember(entry['source'])
+            self._stat = stat_result((
+                member.mode,  # st_mode
+                0,            # st_ino
+                0,            # st_dev
+                0,            # st_nlink
+                member.uid,   # st_uid
+                member.gid,   # st_gid
+                member.size,  # st_size
+                member.atime, # st_atime
+                member.mtime, # st_mtime
+                member.ctime, # st_ctime
+            ))
+            if 'uname' not in entry and entry.get('uid', None) != 0:
+                self.uname = member.uname
+            if 'gname' not in entry and entry.get('gid', None) != 0:
+                self.gname = member.gname
+
     def sub(self, source, name=None):
         entry = self._entry.copy()
         entry['source'] = source
@@ -211,12 +230,14 @@ class Entry:
 
     def __getattr__(self, name):
         if name == 'stat':
-            # no actual file to stat
-            if self.source is None: return None
-            elif self.source.startswith('tar:'): return None
-            elif self.source.startswith('base64:'): return None
-            # save data from source file
-            if self._stat is None: self._stat = stat(self.source, follow_symlinks=False)
+            if self._stat is None:
+                # no actual file to stat
+                if self.source is None: return None
+                elif self.source.startswith('base64:'): return None
+                elif self.source.startswith('tar:'): return None
+                # save data from source file
+                else: self._stat = stat(self.source, follow_symlinks=False)
+
             return self._stat
 
         # symlink permissions are always 777
@@ -232,8 +253,12 @@ class Entry:
 
         # name should either be macro expanded or copied from source
         elif name == 'name':
-            if 'name' in self._entry: return self._expand(self._entry['name'])
-            else: return self.source
+            if 'name' in self._entry:
+                return self._expand(self._entry['name'])
+            elif self.source.startswith('tar:'):
+                return self.source.split(':', 2)[2]
+            else:
+                return self.source
 
         # optional attributes
         elif name in self._entry:
@@ -296,6 +321,13 @@ class ExtInfo(tarfile.TarInfo):
     def __getitem__(self, key):
         return self.children[key]
 
+    def __enter__(self):
+        fileobj = self.extractfile()
+        return fileobj
+
+    def __exit__(self, *args):
+        return None
+
     def _update_tree(self):
         rootname, parts = '', self.name.split('/')
 
@@ -357,6 +389,14 @@ class ExtInfo(tarfile.TarInfo):
     def dirnames(self):
         return self.dirs.keys()
 
+    @property
+    def atime(self):
+        return getattr(self, 'pax_headers', {'atime': 0}).get('atime', 0)
+
+    @property
+    def ctime(self):
+        return getattr(self, 'pax_headers', {'ctime': 0}).get('ctime', 0)
+
     def isvirt(self):
         return self.type == VIRTTYPE
 
@@ -392,6 +432,11 @@ for name in ('add', 'addfile', 'extract', 'extractall'):
     def fn(self, *args, **kwargs):
         raise NotImplementedError(f'TarSource instances do not support `{name}`!')
     setattr(TarSource, name, fn)
+
+@functools.lru_cache(maxsize=8)
+def tarmember(src):
+    _, tar, member = src.split(':', 2)
+    return TarSource.open(tar).getmember(member)
 
 class TarBuilder(tarfile.TarFile):
     def __init__(self, *args, chdir=None, dirs='first', define={}, **kwargs):
@@ -519,6 +564,8 @@ class TarBuilder(tarfile.TarFile):
         if src:
             if src.startswith('base64:'):
                 fn = lambda: BytesIO(b64d(src[7:]))
+            elif src.startswith('tar:'):
+                fn = lambda: tarmember(src)
             elif path.isdir(src):
                 isdir = True
 
