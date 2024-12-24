@@ -8,11 +8,16 @@ import subprocess
 
 from io import BytesIO, BufferedIOBase
 from os import walk, fdopen, stat, path, getcwd, chdir, SEEK_SET, SEEK_END
-from collections import namedtuple, defaultdict, OrderedDict, Iterable
+from collections import namedtuple, defaultdict, OrderedDict
 from base64 import b64decode as b64d
 from functools import partial, lru_cache
 from itertools import chain
 from time import time
+
+try:
+    from collections.abc import Iterable
+except (ModuleNotFoundError, ImportError):
+    from collections import Iterable
 
 # bundled
 import concatjson
