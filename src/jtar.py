@@ -21,6 +21,7 @@ except (ModuleNotFoundError, ImportError):
 
 # bundled
 import concatjson
+from concatreader import ConcatReader
 from chmod import vchmod
 from util import *
 
@@ -235,6 +236,17 @@ class Entry:
                 if self.source is None: return None
                 elif self.source.startswith('base64:'): return None
                 elif self.source.startswith('tar:'): return None
+                # merge stat data
+                elif self.source.startswith('cat:'):
+                    sources = self.source[4:].split(':')
+                    first, rest = sources[0], sources[1:]
+                    result_stat = list(stat(first, follow_symlinks=False))
+                    for source in rest:
+                        more_stat = stat(source, follow_symlinks=False)
+                        # atime, mtime, ctime
+                        for i in (7, 8, 9):
+                            result_stat[i] = max(result_stat[i], more_stat[i])
+                    self._stat = stat_result(result_stat)
                 # save data from source file
                 else: self._stat = stat(self.source, follow_symlinks=False)
 
@@ -565,6 +577,9 @@ class TarBuilder(tarfile.TarFile):
                 fn = lambda: BytesIO(b64d(src[7:]))
             elif src.startswith('tar:'):
                 fn = lambda: tarmember(src)
+            elif src.startswith('cat:'):
+                sources = src[4:].split(':')
+                fn = lambda: ConcatReader(map(lambda source: open(source, 'rb'), sources))
             elif path.isdir(src):
                 isdir = True
 
