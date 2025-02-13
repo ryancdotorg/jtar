@@ -574,7 +574,7 @@ class TarBuilder(tarfile.TarFile):
                 else: fn = partial(self._template, filename=src)
 
             if entry.filter:
-                if fn is not None: fn = partial(open, src, 'rb')
+                if fn is None: fn = partial(open, src, 'rb')
                 fn = cmd_filter(entry.filter, fn)
 
         if fn: thunk = partial(self._add, filefunc=fn, arcname=dst, filter=filter)
@@ -616,8 +616,9 @@ def cmd_filter(args, filefunc):
 
     out = subprocess.check_output(args.pop(0), input=buf)
     if isinstance(data, BufferedIOBase):
-        out = BytesIO(out)
+        out = partial(BytesIO, out)
 
+    # XXX this is probably still buggy
     return cmd_filter(args, lambda: out) if len(args) else out
 
 def tar_entries(out, entries, **kwargs):
