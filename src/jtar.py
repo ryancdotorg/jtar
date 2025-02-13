@@ -540,8 +540,7 @@ class TarBuilder(tarfile.TarFile):
         elif filefunc is not None:
             with filefunc() as f:
                 info = self.tarinfo(arcname)
-                f.seek(0, SEEK_END)
-                info.size = f.tell()
+                info.size = f.seek(0, SEEK_END)
                 f.seek(0, SEEK_SET)
                 self.addfile(filter(info), f)
         else:
