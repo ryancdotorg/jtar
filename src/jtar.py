@@ -701,8 +701,8 @@ def create_manifest(args):
                 entry = {}
                 if info.linkname:
                     entry['link'] = info.linkname
-                else:
-                    entry['source'] = info.name
+                entry['source'] = info.name
+                entry['mode'] = int(oct(info.mode)[2:])
                 entry['mtime'] = info.mtime
                 entry['uid'] = info.uid
                 entry['gid'] = info.gid
